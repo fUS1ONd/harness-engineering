@@ -22,8 +22,8 @@
 
 ## Лимиты, модели и утилиты хоста
 
-- Выбор моделей: оркестрация, редактура, сложная архитектура и вся верификация/ревью — на Google Gemini 4 (`antigravity`); для ускорения простых задач реализации можно использовать DeepSeek V4.1 Flash (`opencode`, `deepseek/deepseek-flash`) с обязательной верификацией большими моделями Antigravity (`gemini-4-carbon` / `gemini-4-argon`) по `/root/.gemini/config/skills/vybor-modeli/SKILL.md`.
-- Перед каждой волной проверять контекстное окно и остаток квоты пула через `ctx` (а для проверки дочернего треда — `ctx <id>`). При приближении оркестратора к порогу контекста (~200k) обновлять состояние усилия (`hod.md`) и передавать работу в новый тред.
+- Выбор моделей: оркестрация (`gemini-4-neon`), редактура, сложная архитектура и вся верификация/ревью (`gemini-4-neon` `"medium"` для потикетных `Standards`/`Spec`, `"high"` на сложных, `gemini-4-carbon` `"high"` для `final-code-review`) — на Google Gemini 4 (`antigravity`); `gemini-4-argon` и `gemini-4-carbon` `"low"` не используются. Для простых и дефолтных задач реализации — DeepSeek V4.1 Flash (`opencode`, `deepseek/deepseek-flash`, `variant: "high"`) с обязательной верификацией моделями Antigravity по `/root/.gemini/config/skills/vybor-modeli/SKILL.md`.
+- Контроль контекста и эстафета (`~200k`): в `~/.gemini/config/hooks.json` работает автоматический синхронный `PreInvocation` хук `context-guard.py` (175k — предупреждение, 200k — стоп-лимит, 260k — аварийная остановка). При достижении ~200k агент записывает состояние в `hod.md` (внутри worktree / `.scratch/`, не коммитить), запускает преемника через `t3_thread_launch` с брифом и ссылкой на `hod.md`, а **преемник первым делом закрывает старый тред** (`t3_thread_organize{action: "settle", threadId: "<старый тред>"}`). Перед каждой волной дополнительно проверяй остаток квоты через `ctx`.
 - Утилиты хоста: искать по коду через `rg` или `git grep` (в `grep` флаги `-B/-A` ставить до `--`); шаги GitHub Actions смотреть через `gh run view <id> --json jobs`, сырые логи — с `--allow-escape-sequences`; многострочный Python запускать через `python3 - <<'EOF'`.
 
 ## Ревью и гейт качества
