@@ -1,0 +1,741 @@
+#!/usr/bin/env python3
+"""Лёгкий executor-driven раннер параметризованных капсул (по мотивам SkillCache, arXiv:2611.10022).
+
+Прогоняет смежные детерминированные программы капсулы подряд, передавая их JSON-выходы
+через биндинги, и возвращает управление модели только когда:
+  - не хватает входных биндингов (`needs_bindings`);
+  - встретился шаг, требующий суждения модели (`your_steps`);
+  - упала скомпилированная программа (`your_steps` с флагом `program_failed` — деоптимизация
+    только этого шага, остальной план остаётся скомпилированным);
+  - все программные шаги выполнены (`complete`).
+
+Использование:
+  skillcache-run qualify <capsule_dir> [--examples '<json>'] [--replay]
+  skillcache-run prompt  <capsule_dir>
+  skillcache-run run     <capsule_dir> --state <state.json> ['<bindings_json>']
+  skillcache-run continue --state <state.json> ['<bindings_json>']
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+from typing import Any
+
+
+SECRET_ENV_SUBSTRINGS = (
+    "TOKEN",
+    "SECRET",
+    "PASSWORD",
+    "PASSWD",
+    "API_KEY",
+    "PRIVATE_KEY",
+    "ACCESS_KEY",
+    "AUTH",
+)
+
+
+def load_capsule(capsule_dir: Path) -> dict[str, Any]:
+    manifest_path = capsule_dir / "capsule.json"
+    if not manifest_path.is_file():
+        raise ValueError(f"Не найден манифест капсулы: {manifest_path}")
+    with manifest_path.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        raise ValueError("capsule.json должен содержать JSON-объект")
+    return data
+
+
+def all_plan_steps(capsule: dict[str, Any]) -> list[dict[str, Any]]:
+    """Объединяет основные шаги (pi) и шаги верификации (V) в единый линейный план."""
+    steps: list[dict[str, Any]] = []
+    for phase_name, key in (("procedure", "steps"), ("verification", "verification")):
+        raw_steps = capsule.get(key, [])
+        if not isinstance(raw_steps, list):
+            raise ValueError(f"Поле '{key}' должно быть списком")
+        for idx, step in enumerate(raw_steps):
+            if not isinstance(step, dict):
+                raise ValueError(f"Шаг {key}[{idx}] должен быть объектом")
+            item = dict(step)
+            item.setdefault("id", f"{phase_name}_{idx + 1}")
+            item["phase"] = phase_name
+            steps.append(item)
+    return steps
+
+
+def validate_structure_and_dataflow(capsule: dict[str, Any]) -> list[str]:
+    """Gate 1: проверка схемы капсулы и графа зависимостей биндингов."""
+    errors: list[str] = []
+
+    for field in ("name", "description"):
+        if not isinstance(capsule.get(field), str) or not capsule[field].strip():
+            errors.append(f"Отсутствует или пусто обязательное строковое поле '{field}'")
+
+    bindings = capsule.get("bindings", {})
+    if not isinstance(bindings, dict):
+        errors.append("Поле 'bindings' должно быть объектом")
+        bindings = {}
+
+    programs = capsule.get("programs", {})
+    if not isinstance(programs, dict):
+        errors.append("Поле 'programs' должно быть объектом")
+        programs = {}
+
+    try:
+        steps = all_plan_steps(capsule)
+    except ValueError as exc:
+        return [str(exc)]
+
+    if not steps:
+        errors.append("План капсулы пуст: нет шагов в 'steps'")
+
+    produced_by: dict[str, str] = {}
+    used_programs: set[str] = set()
+    step_ids: set[str] = set()
+
+    for idx, step in enumerate(steps):
+        sid = step.get("id")
+        if sid in step_ids:
+            errors.append(f"Дублирующийся id шага: '{sid}'")
+        step_ids.add(sid)
+
+        stype = step.get("type")
+        if stype not in ("program", "nl"):
+            errors.append(f"Шаг '{sid}' (#{idx}): неизвестный type='{stype}' (ожидается 'program' или 'nl')")
+            continue
+
+        if not isinstance(step.get("instruction"), str) or not step["instruction"].strip():
+            errors.append(f"Шаг '{sid}': отсутствует непустое поле 'instruction'")
+
+        if stype == "program":
+            prog_name = step.get("program")
+            if prog_name not in programs:
+                errors.append(f"Шаг '{sid}' ссылается на необъявленную программу '{prog_name}'")
+                continue
+            used_programs.add(prog_name)
+            prog = programs[prog_name]
+
+            if not isinstance(prog.get("command"), list) or not prog["command"]:
+                errors.append(f"Программа '{prog_name}': поле 'command' должно быть непустым списком")
+
+            for inp in prog.get("inputs", []):
+                if inp not in bindings and inp not in produced_by:
+                    errors.append(
+                        f"Программа '{prog_name}' (шаг '{sid}') читает биндинг '{inp}', "
+                        f"который не объявлен в 'bindings' и не произведён предыдущими шагами"
+                    )
+
+            for out in prog.get("outputs", []):
+                if out in produced_by:
+                    errors.append(
+                        f"Биндинг '{out}' производится более чем одной программой: "
+                        f"'{produced_by[out]}' и '{prog_name}'"
+                    )
+                produced_by[out] = prog_name
+
+    unused = set(programs.keys()) - used_programs
+    if unused:
+        errors.append(f"Объявлены неиспользуемые программы: {sorted(unused)}")
+
+    return errors
+
+
+def sanitized_env() -> dict[str, str]:
+    """Удаляет переменные окружения, похожие на секреты, сохраняя рабочее окружение."""
+    clean: dict[str, str] = {}
+    for k, v in os.environ.items():
+        upper = k.upper()
+        if any(sub in upper for sub in SECRET_ENV_SUBSTRINGS):
+            continue
+        clean[k] = v
+    return clean
+
+
+def resolve_command(capsule_dir: Path, command: list[str]) -> list[str]:
+    """Разрешает относительные пути скриптов относительно каталога капсулы."""
+    resolved: list[str] = []
+    for i, token in enumerate(command):
+        candidate = capsule_dir / token
+        if i > 0 and not os.path.isabs(token) and candidate.exists():
+            resolved.append(str(candidate.resolve()))
+        elif i == 0 and not os.path.isabs(token) and candidate.exists():
+            resolved.append(str(candidate.resolve()))
+        else:
+            resolved.append(token)
+    return resolved
+
+
+def run_program_checks(capsule_dir: Path, capsule: dict[str, Any]) -> list[str]:
+    """Gate 2: синтаксическая / сборочная проверка каждой программы капсулы."""
+    errors: list[str] = []
+    env = sanitized_env()
+    for name, prog in capsule.get("programs", {}).items():
+        check_cmd = prog.get("check")
+        if not check_cmd:
+            continue
+        cmd = resolve_command(capsule_dir, check_cmd)
+        proc = subprocess.run(
+            cmd,
+            cwd=str(capsule_dir),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        if proc.returncode != 0:
+            diag = (proc.stderr or proc.stdout).strip()
+            errors.append(f"Check программы '{name}' завершился с кодом {proc.returncode}: {diag}")
+    return errors
+
+
+def collect_required_bindings_before_handover(
+    capsule: dict[str, Any],
+    steps: list[dict[str, Any]],
+    start_pos: int,
+    known_bindings: dict[str, Any],
+) -> dict[str, str]:
+    """Собирает все биндинги, нужные подряд идущим программам до ближайшего NL-шага."""
+    bindings_meta = capsule.get("bindings", {})
+    programs = capsule.get("programs", {})
+    needed: dict[str, str] = {}
+    will_be_produced: set[str] = set()
+
+    for step in steps[start_pos:]:
+        if step["type"] == "nl":
+            break
+        prog = programs[step["program"]]
+        for inp in prog.get("inputs", []):
+            if inp in known_bindings or inp in will_be_produced:
+                continue
+            meta = bindings_meta.get(inp, {})
+            if "default" in meta:
+                continue
+            needed[inp] = meta.get("description", f"Значение для '{inp}'")
+        for out in prog.get("outputs", []):
+            will_be_produced.add(out)
+
+    return needed
+
+
+def apply_default_bindings(capsule: dict[str, Any], bindings: dict[str, Any]) -> None:
+    """Подставляет значения по умолчанию из манифеста для отсутствующих необязательных биндингов."""
+    for name, meta in capsule.get("bindings", {}).items():
+        if name not in bindings and isinstance(meta, dict) and "default" in meta:
+            bindings[name] = meta["default"]
+
+
+def execute_program_step(
+    capsule_dir: Path,
+    prog_name: str,
+    prog: dict[str, Any],
+    bindings: dict[str, Any],
+) -> tuple[bool, dict[str, Any], str, float]:
+    """Запускает одну программу капсулы, передавая ей JSON с входными биндингами."""
+    inputs_payload = {k: bindings[k] for k in prog.get("inputs", []) if k in bindings}
+    timeout_sec = int(prog.get("timeout_sec", 300))
+    retries = int(prog.get("retries", 0))
+    cmd = resolve_command(capsule_dir, prog["command"])
+    env = sanitized_env()
+    env["SKILLCACHE_CAPSULE_DIR"] = str(capsule_dir.resolve())
+
+    last_diag = ""
+    start_ts = time.monotonic()
+
+    for attempt in range(retries + 1):
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", prefix="sc_in_", encoding="utf-8", delete=False
+        ) as tf:
+            json.dump(inputs_payload, tf, ensure_ascii=False)
+            input_path = tf.name
+
+        try:
+            env["SKILLCACHE_INPUT"] = input_path
+            proc = subprocess.run(
+                cmd + [input_path],
+                cwd=str(capsule_dir),
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=timeout_sec,
+            )
+        except subprocess.TimeoutExpired:
+            last_diag = f"Таймаут выполнения программы '{prog_name}' ({timeout_sec}s)"
+            continue
+        finally:
+            try:
+                os.unlink(input_path)
+            except OSError:
+                pass
+
+        if proc.returncode != 0:
+            stderr = proc.stderr.strip()
+            stdout = proc.stdout.strip()
+            parts = [f"exit_code={proc.returncode}"]
+            if stderr:
+                parts.append(f"stderr:\n{stderr[-4000:]}")
+            if stdout:
+                parts.append(f"stdout:\n{stdout[-2000:]}")
+            last_diag = "\n".join(parts)
+            continue
+
+        raw_out = proc.stdout.strip()
+        if not raw_out:
+            parsed: dict[str, Any] = {}
+        else:
+            try:
+                parsed = json.loads(raw_out)
+            except json.JSONDecodeError as exc:
+                last_diag = f"Программа '{prog_name}' вернула невалидный JSON ({exc}): {raw_out[-1000:]}"
+                continue
+            if not isinstance(parsed, dict):
+                last_diag = f"Программа '{prog_name}' должна вернуть JSON-объект, получено: {type(parsed).__name__}"
+                continue
+
+        missing_outputs = [o for o in prog.get("outputs", []) if o not in parsed]
+        if missing_outputs:
+            last_diag = (
+                f"Программа '{prog_name}' не вернула заявленные outputs: {missing_outputs}. "
+                f"Получены ключи: {sorted(parsed.keys())}"
+            )
+            continue
+
+        return True, parsed, "", round(time.monotonic() - start_ts, 3)
+
+    return False, {}, last_diag, round(time.monotonic() - start_ts, 3)
+
+
+def program_source_path(capsule_dir: Path, prog: dict[str, Any]) -> str | None:
+    for token in prog.get("command", []):
+        candidate = capsule_dir / token
+        if not os.path.isabs(token) and candidate.is_file():
+            return str(candidate.resolve())
+        if os.path.isabs(token) and Path(token).is_file():
+            return token
+    return None
+
+
+def save_state(state_path: Path, state: dict[str, Any]) -> None:
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = state_path.with_suffix(state_path.suffix + ".tmp")
+    with tmp_path.open("w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, state_path)
+
+
+def advance_plan(
+    capsule_dir: Path,
+    capsule: dict[str, Any],
+    state: dict[str, Any],
+    state_path: Path,
+) -> dict[str, Any]:
+    """Прогоняет план от текущей позиции до ближайшего hand-over или завершения."""
+    steps = all_plan_steps(capsule)
+    programs = capsule.get("programs", {})
+    bindings: dict[str, Any] = state["bindings"]
+    apply_default_bindings(capsule, bindings)
+
+    completed_this_turn: list[dict[str, Any]] = []
+    pos: int = state["position"]
+
+    while pos < len(steps):
+        step = steps[pos]
+
+        # Блок подряд идущих NL-шагов передаём модели за один раз
+        if step["type"] == "nl":
+            nl_batch: list[dict[str, Any]] = []
+            while pos < len(steps) and steps[pos]["type"] == "nl":
+                s = steps[pos]
+                nl_batch.append(
+                    {
+                        "id": s["id"],
+                        "phase": s["phase"],
+                        "instruction": s["instruction"],
+                    }
+                )
+                pos += 1
+
+            state["position"] = pos
+            state["awaiting"] = pos
+
+            if pos >= len(steps):
+                state["status"] = "complete"
+                save_state(state_path, state)
+                return {
+                    "status": "complete",
+                    "completed": completed_this_turn,
+                    "steps": nl_batch,
+                    "bindings": bindings,
+                }
+
+            next_needed = collect_required_bindings_before_handover(capsule, steps, pos, bindings)
+            state["status"] = "your_steps"
+            save_state(state_path, state)
+            return {
+                "status": "your_steps",
+                "completed": completed_this_turn,
+                "steps": nl_batch,
+                "bindings_needed": next_needed,
+            }
+
+        # Перед запуском программы проверяем, хватает ли всех биндингов до следующего hand-over
+        needed = collect_required_bindings_before_handover(capsule, steps, pos, bindings)
+        if needed:
+            state["position"] = pos
+            state["awaiting"] = pos
+            state["status"] = "needs_bindings"
+            save_state(state_path, state)
+            return {
+                "status": "needs_bindings",
+                "completed": completed_this_turn,
+                "bindings_needed": needed,
+            }
+
+        # Сохраняем state ДО запуска программы (устойчивость к прерыванию/таймауту)
+        state["position"] = pos
+        state["awaiting"] = pos
+        save_state(state_path, state)
+
+        prog_name = step["program"]
+        prog = programs[prog_name]
+        ok, result, diag, duration = execute_program_step(capsule_dir, prog_name, prog, bindings)
+
+        if ok:
+            for out_key in prog.get("outputs", []):
+                bindings[out_key] = result[out_key]
+            record = {
+                "id": step["id"],
+                "phase": step["phase"],
+                "program": prog_name,
+                "duration_sec": duration,
+                "result": result,
+            }
+            completed_this_turn.append(record)
+            state["completed"].append(record)
+            pos += 1
+            continue
+
+        # Деоптимизация (Section 6.2): передаём упавший шаг + идущие сразу за ним NL-шаги модели,
+        # а остальной план остаётся скомпилированным и продолжится после `continue`.
+        failed_item: dict[str, Any] = {
+            "id": step["id"],
+            "phase": step["phase"],
+            "program": prog_name,
+            "program_failed": True,
+            "instruction": step["instruction"],
+            "diagnostics": diag,
+            "expected_outputs": prog.get("outputs", []),
+        }
+        src = program_source_path(capsule_dir, prog)
+        if src:
+            failed_item["program_source"] = src
+
+        state["failed"].append(failed_item)
+        handed_over: list[dict[str, Any]] = [failed_item]
+        pos += 1
+
+        while pos < len(steps) and steps[pos]["type"] == "nl":
+            s = steps[pos]
+            handed_over.append(
+                {
+                    "id": s["id"],
+                    "phase": s["phase"],
+                    "instruction": s["instruction"],
+                }
+            )
+            pos += 1
+
+        next_needed: dict[str, str] = {}
+        # Если outputs упавшего шага нужны последующим программам, просим модель их передать
+        for out_key in prog.get("outputs", []):
+            if out_key not in bindings:
+                meta = capsule.get("bindings", {}).get(out_key, {})
+                next_needed[out_key] = meta.get(
+                    "description", f"Выход упавшего шага '{step['id']}' ({out_key})"
+                )
+        next_needed.update(collect_required_bindings_before_handover(capsule, steps, pos, bindings))
+
+        state["position"] = pos
+        state["awaiting"] = pos
+        state["status"] = "your_steps"
+        save_state(state_path, state)
+        return {
+            "status": "your_steps",
+            "completed": completed_this_turn,
+            "steps": handed_over,
+            "bindings_needed": next_needed,
+        }
+
+    state["position"] = pos
+    state["awaiting"] = pos
+    state["status"] = "complete"
+    save_state(state_path, state)
+    return {
+        "status": "complete",
+        "completed": completed_this_turn,
+        "steps": [],
+        "bindings": bindings,
+    }
+
+
+def render_executor_prompt(capsule_dir: Path, capsule: dict[str, Any]) -> str:
+    """Генерирует компактный промпт для агента (Figure 10 executor-driven), без кода программ."""
+    steps = all_plan_steps(capsule)
+    leading_nl: list[str] = []
+    first_prog_idx = 0
+    for idx, step in enumerate(steps):
+        if step["type"] == "nl":
+            leading_nl.append(step["instruction"])
+            first_prog_idx = idx + 1
+        else:
+            break
+
+    initial_bindings = collect_required_bindings_before_handover(
+        capsule, steps, first_prog_idx, {}
+    )
+    lines = [
+        f"## Капсула: {capsule['name']}",
+        capsule["description"],
+        "",
+        "### Входные биндинги",
+    ]
+    if initial_bindings:
+        for k, desc in initial_bindings.items():
+            lines.append(f"- `{k}`: {desc}")
+    else:
+        lines.append("- нет обязательных биндингов")
+
+    optional_defaults = {
+        k: meta for k, meta in capsule.get("bindings", {}).items()
+        if isinstance(meta, dict) and "default" in meta
+    }
+    if optional_defaults:
+        lines.append("")
+        lines.append("### Необязательные биндинги (есть значения по умолчанию)")
+        for k, meta in optional_defaults.items():
+            lines.append(f"- `{k}` (по умолчанию `{json.dumps(meta['default'], ensure_ascii=False)}`): {meta.get('description', '')}")
+
+    if leading_nl:
+        lines.append("")
+        lines.append("### Шаги до запуска раннера")
+        for i, instr in enumerate(leading_nl, 1):
+            lines.append(f"{i}. {instr}")
+
+    lines.extend(
+        [
+            "",
+            "### Протокол запуска (executor-driven)",
+            f"Запусти план один раз: `skillcache-run run {capsule_dir.resolve()} --state <path/to/state.json> '<JSON биндингов>'`.",
+            "Раннер сам выполнит все смежные программы и вернёт JSON со статусом:",
+            "- `complete`: все программы выполнены; выполни оставшиеся `steps` (если есть) и заверши задачу.",
+            "- `needs_bindings`: передай недостающие `bindings_needed` через `skillcache-run continue --state <state.json> '<JSON>'`.",
+            "- `your_steps`: выполни перечисленные `steps` по порядку и вызови `skillcache-run continue --state <state.json> '<JSON>'`.",
+            "  Если шаг помечен `program_failed: true`, выполни его обычными инструментами (исходник указан в `program_source`), не чини саму программу в рамках текущей задачи, передай нужные `bindings_needed` в `continue`.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def cmd_qualify(args: argparse.Namespace) -> int:
+    capsule_dir = Path(args.capsule_dir).resolve()
+    capsule = load_capsule(capsule_dir)
+
+    report: dict[str, Any] = {
+        "capsule": capsule.get("name"),
+        "gate1_structure": {"passed": False, "errors": []},
+        "gate2_checks": {"passed": False, "errors": []},
+        "gate3_replay": {"skipped": not args.replay, "passed": None, "errors": []},
+    }
+
+    g1 = validate_structure_and_dataflow(capsule)
+    report["gate1_structure"] = {"passed": len(g1) == 0, "errors": g1}
+    if g1:
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 1
+
+    g2 = run_program_checks(capsule_dir, capsule)
+    report["gate2_checks"] = {"passed": len(g2) == 0, "errors": g2}
+    if g2:
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 1
+
+    if args.replay:
+        examples = json.loads(args.examples) if args.examples else {}
+        if not isinstance(examples, dict):
+            report["gate3_replay"] = {
+                "skipped": False,
+                "passed": False,
+                "errors": ["--examples должен быть JSON-объектом"],
+            }
+            print(json.dumps(report, ensure_ascii=False, indent=2))
+            return 1
+
+        replay_errors: list[str] = []
+        with tempfile.TemporaryDirectory(prefix="sc_replay_") as td:
+            state_path = Path(td) / "replay_state.json"
+            state: dict[str, Any] = {
+                "capsule_dir": str(capsule_dir),
+                "capsule_name": capsule["name"],
+                "position": 0,
+                "awaiting": 0,
+                "bindings": dict(examples),
+                "completed": [],
+                "failed": [],
+                "status": "running",
+            }
+            # Прогоняем план; при NL-шагах просто продвигаемся дальше (примеры E уже в bindings)
+            for _ in range(100):
+                res = advance_plan(capsule_dir, capsule, state, state_path)
+                if res["status"] == "complete":
+                    break
+                if res["status"] == "needs_bindings":
+                    replay_errors.append(f"В --examples не хватает биндингов: {list(res['bindings_needed'].keys())}")
+                    break
+                if res["status"] == "your_steps":
+                    failed_steps = [s for s in res["steps"] if s.get("program_failed")]
+                    if failed_steps:
+                        for fs in failed_steps:
+                            replay_errors.append(
+                                f"Replay упал на шаге '{fs['id']}' ({fs['program']}): {fs['diagnostics']}"
+                            )
+                        # Как в Section 5.3, продолжаем replay, чтобы собрать все ошибки
+                        continue
+            else:
+                replay_errors.append("Превышен лимит итераций replay")
+
+        report["gate3_replay"] = {
+            "skipped": False,
+            "passed": len(replay_errors) == 0,
+            "errors": replay_errors,
+        }
+        if replay_errors:
+            print(json.dumps(report, ensure_ascii=False, indent=2))
+            return 1
+
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    return 0
+
+
+def parse_json_arg(raw: str | None) -> dict[str, Any]:
+    if not raw:
+        return {}
+    data = json.loads(raw)
+    if not isinstance(data, dict):
+        raise ValueError("Аргумент биндингов должен быть JSON-объектом")
+    return data
+
+
+def cmd_prompt(args: argparse.Namespace) -> int:
+    capsule_dir = Path(args.capsule_dir).resolve()
+    capsule = load_capsule(capsule_dir)
+    errors = validate_structure_and_dataflow(capsule)
+    if errors:
+        print(json.dumps({"error": "Капсула не прошла Gate 1", "details": errors}, ensure_ascii=False), file=sys.stderr)
+        return 1
+    print(render_executor_prompt(capsule_dir, capsule))
+    return 0
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    capsule_dir = Path(args.capsule_dir).resolve()
+    capsule = load_capsule(capsule_dir)
+    errors = validate_structure_and_dataflow(capsule)
+    if errors:
+        print(json.dumps({"error": "Капсула не прошла Gate 1", "details": errors}, ensure_ascii=False), file=sys.stderr)
+        return 1
+
+    bindings = parse_json_arg(args.bindings_opt if args.bindings_opt is not None else args.bindings)
+    state_path = Path(args.state).resolve()
+    state: dict[str, Any] = {
+        "capsule_dir": str(capsule_dir),
+        "capsule_name": capsule["name"],
+        "position": 0,
+        "awaiting": 0,
+        "bindings": bindings,
+        "completed": [],
+        "failed": [],
+        "status": "running",
+    }
+    report = advance_plan(capsule_dir, capsule, state, state_path)
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_continue(args: argparse.Namespace) -> int:
+    state_path = Path(args.state).resolve()
+    if not state_path.is_file():
+        print(json.dumps({"error": f"Не найден файл состояния: {state_path}"}, ensure_ascii=False), file=sys.stderr)
+        return 1
+
+    with state_path.open("r", encoding="utf-8") as f:
+        state = json.load(f)
+
+    capsule_dir = Path(state["capsule_dir"]).resolve()
+    capsule = load_capsule(capsule_dir)
+
+    new_bindings = parse_json_arg(args.bindings_opt if args.bindings_opt is not None else args.bindings)
+    state["bindings"].update(new_bindings)
+    state["position"] = state["awaiting"]
+
+    report = advance_plan(capsule_dir, capsule, state, state_path)
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="skillcache-run",
+        description="Executor-driven раннер параметризованных капсул (SkillCache)",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_qual = sub.add_parser("qualify", help="Проверить капсулу через 3 гейта (структура, check, replay)")
+    p_qual.add_argument("capsule_dir", help="Путь к каталогу капсулы")
+    p_qual.add_argument("--examples", default=None, help="JSON-объект примеров биндингов E для replay")
+    p_qual.add_argument("--replay", action="store_true", help="Выполнить Gate 3 (end-to-end replay)")
+    p_qual.set_defaults(func=cmd_qualify)
+
+    p_prompt = sub.add_parser("prompt", help="Сформировать компактный промпт капсулы для агента")
+    p_prompt.add_argument("capsule_dir", help="Путь к каталогу капсулы")
+    p_prompt.set_defaults(func=cmd_prompt)
+
+    p_run = sub.add_parser("run", help="Запустить капсулу с начала")
+    p_run.add_argument("capsule_dir", help="Путь к каталогу капсулы")
+    p_run.add_argument("--state", required=True, help="Путь к файлу состояния плана")
+    p_run.add_argument("--bindings", dest="bindings_opt", default=None, help="JSON-объект начальных биндингов")
+    p_run.add_argument("bindings", nargs="?", default=None, help="JSON-объект начальных биндингов")
+    p_run.set_defaults(func=cmd_run)
+
+    p_cont = sub.add_parser("continue", help="Продолжить план после передачи биндингов или шагов модели")
+    p_cont.add_argument("--state", required=True, help="Путь к файлу состояния плана")
+    p_cont.add_argument("--bindings", dest="bindings_opt", default=None, help="JSON-объект новых биндингов")
+    p_cont.add_argument("bindings", nargs="?", default=None, help="JSON-объект новых биндингов")
+    p_cont.set_defaults(func=cmd_continue)
+
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    # Разбираем подкоманду, затем parse_intermixed_args на её аргументах,
+    # чтобы допускать порядок `run <capsule> --state <file> '<json>'`.
+    if len(sys.argv) >= 2 and sys.argv[1] in ("qualify", "prompt", "run", "continue"):
+        sub_name = sys.argv[1]
+        sub_parser = parser._subparsers._group_actions[0].choices[sub_name]
+        args = sub_parser.parse_intermixed_args(sys.argv[2:])
+    else:
+        args = parser.parse_args()
+    try:
+        return args.func(args)
+    except Exception as exc:
+        print(json.dumps({"error": str(exc)}, ensure_ascii=False), file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

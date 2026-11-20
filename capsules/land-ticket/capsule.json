@@ -1,0 +1,90 @@
+{
+  "name": "land-ticket",
+  "description": "Слияние готового тикета из временного worktree исполнителя в интеграционную ветку усилия: проверка чистоты, rebase на ветку усилия, полные проверки, git merge --ff-only, очистка worktree/ветки t3/* и верификация итогового состояния.",
+  "bindings": {
+    "effort_worktree": {
+      "description": "Абсолютный путь к worktree ветки усилия"
+    },
+    "effort_branch": {
+      "description": "Имя интеграционной ветки усилия (например, feat/my-effort)"
+    },
+    "ticket_worktree": {
+      "description": "Абсолютный путь к временному worktree исполнителя"
+    },
+    "check_command": {
+      "description": "Команда полных проверок в ticket_worktree перед слиянием (например, 'make check'); пустая строка — пропустить проверки",
+      "default": ""
+    },
+    "cleanup": {
+      "description": "Удалять ли временный worktree и ветку t3/* после успешного ff-only merge",
+      "default": true
+    }
+  },
+  "programs": {
+    "preflight_and_rebase": {
+      "command": ["python3", "programs/preflight_and_rebase.py"],
+      "check": ["python3", "-m", "py_compile", "programs/preflight_and_rebase.py"],
+      "inputs": ["effort_worktree", "effort_branch", "ticket_worktree"],
+      "outputs": ["ticket_branch", "rebased_head", "effort_head_before", "commits_count"],
+      "timeout_sec": 120,
+      "retries": 0
+    },
+    "run_checks": {
+      "command": ["python3", "programs/run_checks.py"],
+      "check": ["python3", "-m", "py_compile", "programs/run_checks.py"],
+      "inputs": ["ticket_worktree", "check_command"],
+      "outputs": ["checks_passed", "check_duration_sec"],
+      "timeout_sec": 900,
+      "retries": 0
+    },
+    "ff_merge_and_cleanup": {
+      "command": ["python3", "programs/ff_merge_and_cleanup.py"],
+      "check": ["python3", "-m", "py_compile", "programs/ff_merge_and_cleanup.py"],
+      "inputs": ["effort_worktree", "effort_branch", "ticket_worktree", "ticket_branch", "rebased_head", "cleanup"],
+      "outputs": ["merged_head", "worktree_removed", "branch_deleted"],
+      "timeout_sec": 120,
+      "retries": 0
+    },
+    "verify_land": {
+      "command": ["python3", "programs/verify_land.py"],
+      "check": ["python3", "-m", "py_compile", "programs/verify_land.py"],
+      "inputs": ["effort_worktree", "effort_branch", "ticket_worktree", "merged_head", "cleanup"],
+      "outputs": ["verified"],
+      "timeout_sec": 60,
+      "retries": 0
+    }
+  },
+  "steps": [
+    {
+      "id": "preflight_and_rebase",
+      "type": "program",
+      "program": "preflight_and_rebase",
+      "instruction": "Проверить чистоту effort_worktree и ticket_worktree, подтянуть effort_branch и сделать rebase ветки тикета поверх effort_branch (при конфликте разрешить конфликт вручную в ticket_worktree и передать rebased_head, ticket_branch, effort_head_before, commits_count)."
+    },
+    {
+      "id": "run_checks",
+      "type": "program",
+      "program": "run_checks",
+      "instruction": "Запустить полную проверку check_command в ticket_worktree; при падении устранить первопричину (без костылей), закоммитить фикс и передать checks_passed=true и check_duration_sec."
+    },
+    {
+      "id": "ff_merge_and_cleanup",
+      "type": "program",
+      "program": "ff_merge_and_cleanup",
+      "instruction": "Влить rebased_head в effort_worktree через git merge --ff-only и при cleanup=true удалить временный ticket_worktree и локальную ветку t3/*."
+    }
+  ],
+  "verification": [
+    {
+      "id": "verify_land",
+      "type": "program",
+      "program": "verify_land",
+      "instruction": "Убедиться, что effort_worktree чист, HEAD совпадает с merged_head на effort_branch, а ticket_worktree удалён (при cleanup=true)."
+    },
+    {
+      "id": "settle_and_mark_done",
+      "type": "nl",
+      "instruction": "Закрыть дочерний тред исполнителя через t3_thread_organize{action: \"settle\"} и обновить статус тикета на Status: done."
+    }
+  ]
+}
