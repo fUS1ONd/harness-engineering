@@ -8,6 +8,11 @@
   - Архитектура и команды: `/root/rumap/ARCHITECTURE.md`
   - Домен и словарь: `/root/rumap/CONTEXT.md`
   - Стандарты Go-кода и антипаттерны: `/root/rumap/CODING_STANDARDS.md`
+- **`/root/rumap-core`** (`rumap/rumap-core`) — общее platform-independent Go-ядро (`AGENTS.md`, `CODING_STANDARDS.md`, `Makefile`).
+- **`/root/rumap-android`** (`rumap/rumap-android`) — мобильная точка наблюдения Android (Go JNI + Kotlin/Compose).
+  - Архитектура и карта модулей: `/root/rumap-android/ARCHITECTURE.md`
+  - Домен и словарь: `/root/rumap-android/GLOSSARY.md`
+  - Стандарты Go/Kotlin/JNI: `/root/rumap-android/CODING_STANDARDS.md`
 - **`/root/rumap-hq`** (`fUS1ONd/rumap-hq`) — деловая база `rumap`: метрики, продуктовые решения (`NOW.md`).
 - **`/root/research`** — база исследований по всем проектам (правила — `/root/research/README.md`, оглавление — `/root/research/INDEX.md`). Перед новым исследованием проверяй `INDEX.md`.
 
