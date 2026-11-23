@@ -24,6 +24,7 @@
 - **Оркестрация и делегаты T3 Code:** [workflow/orchestration.md](workflow/orchestration.md)
 - **Трекер задач и спеки (`.scratch/`):** [workflow/issue-tracker.md](workflow/issue-tracker.md)
 - **Макеты и экраны до кода (`html_render`):** [workflow/ui-preview.md](workflow/ui-preview.md)
+- **E2E-стенд проверки VPN-подписок (`ssh home`):** [workflow/vpn-e2e-stand.md](workflow/vpn-e2e-stand.md) (`scripts/vpn-e2e-stand.py`)
 - **Инженерные принципы и ворота качества:** [standards/engineering.md](standards/engineering.md)
 
 ## Глобальные правила коммитов и контекста
