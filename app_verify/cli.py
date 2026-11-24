@@ -11,6 +11,15 @@ from typing import Any, TextIO
 
 from .android import ALLOWED_HDD_ROOT, AndroidKvmAdapter, AndroidStandConfig
 from .core import AdapterRegistry, PlatformAdapter, StandError
+from .debug_hooks import DEFAULT_DEBUG_PACKAGE, DebugHooksClient
+from .issues import (
+    OwnerApprovalRequiredError,
+    create_approved_issues,
+    deduplicate_findings,
+    fetch_open_issues,
+    load_open_issues,
+)
+from .report import load_verification_report, render_chat_summary, render_markdown_report
 from .ui_driver import (
     DEFAULT_MOBILE_MCP_PACKAGE,
     build_mcp_server_config,
@@ -134,7 +143,98 @@ def _build_parser() -> argparse.ArgumentParser:
     p_drv_call.add_argument("--package", default=DEFAULT_MOBILE_MCP_PACKAGE, help="npm-пакет драйвера")
     p_drv_call.add_argument("--timeout", type=float, default=30.0, help="Таймаут MCP-вызова (сек)")
 
+    p_debug = sub.add_parser(
+        "debug",
+        help="White-box debug-хуки debug-сборки `ru.rumap.android.debug` через am broadcast",
+    )
+    debug_sub = p_debug.add_subparsers(dest="debug_command", required=True)
+
+    p_dbg_nav = debug_sub.add_parser("navigate", help="Перейти на экран/диалог приложения")
+    p_dbg_nav.add_argument("target", nargs="?", default=None, help="Целевой экран (например home/settings/update)")
+    p_dbg_nav.add_argument("--target", dest="target_opt", default=None, help="Целевой экран (альтернатива позиционному)")
+    _add_debug_common_args(p_dbg_nav)
+
+    p_dbg_mock = debug_sub.add_parser("mock-state", help="Применить мок сетевого/синхронизационного состояния")
+    p_dbg_mock.add_argument("--preset", required=True, help="Пресет: clear|none|offline|degraded_cellular|vpn_active|center_sync_error")
+    p_dbg_mock.add_argument("--error-message", default=None, help="Кастомный текст ошибки для мока")
+    _add_debug_common_args(p_dbg_mock)
+
+    p_dbg_reset = debug_sub.add_parser("reset-state", help="Сбросить локальную БД, настройки и debug-overlay")
+    _add_debug_common_args(p_dbg_reset)
+
+    p_dbg_dump = debug_sub.add_parser("dump-diagnostics", help="Снять read-only дамп диагностики приложения")
+    p_dbg_dump.add_argument("--output-path", default=None, help="Путь внутри cacheDir приложения для сохранения JSON")
+    _add_debug_common_args(p_dbg_dump)
+
+    p_report = sub.add_parser("report", help="Сгенерировать Markdown/JSON отчёт верификации из run.json")
+    p_report.add_argument("--input", required=True, help="Путь к run.json с результатами прогона")
+    p_report.add_argument("--open-issues", default=None, help="JSON открытых issue для секции кандидатов")
+    p_report.add_argument("--output", default=None, help="Сохранить Markdown-отчёт в файл")
+    p_report.add_argument("--chat-summary", action="store_true", help="Вывести краткую сводку для чата")
+    p_report.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        default=argparse.SUPPRESS,
+        help="Вывод в формате JSON",
+    )
+
+    p_issues = sub.add_parser("issues", help="Дедупликация находок и owner-gated создание GitHub Issues")
+    issues_sub = p_issues.add_subparsers(dest="issues_command", required=True)
+
+    p_dedup = issues_sub.add_parser("dedup", help="Сверить находки с открытыми GitHub Issues")
+    p_dedup.add_argument("--input", required=True, help="Путь к run.json с результатами прогона")
+    dedup_source = p_dedup.add_mutually_exclusive_group(required=True)
+    dedup_source.add_argument("--open-issues", default=None, help="JSON открытых issue (без обращения к GitHub)")
+    dedup_source.add_argument("--repo", default=None, help="Репозиторий owner/repo для `gh issue list`")
+    p_dedup.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        default=argparse.SUPPRESS,
+        help="Вывод в формате JSON",
+    )
+
+    p_create = issues_sub.add_parser("create", help="Завести issue для одобренных владельцем находок")
+    p_create.add_argument("--input", required=True, help="Путь к run.json с результатами прогона")
+    p_create.add_argument("--repo", required=True, help="Репозиторий owner/repo для `gh issue create`")
+    create_source = p_create.add_mutually_exclusive_group(required=True)
+    create_source.add_argument("--open-issues", default=None, help="JSON открытых issue для дедупликации")
+    create_source.add_argument("--fetch-open", action="store_true", help="Загрузить открытые issue через gh")
+    p_create.add_argument("--approve", default=None, help="Список ID одобренных находок через запятую")
+    p_create.add_argument("--approve-all-new", action="store_true", help="Одобрить все новые находки")
+    p_create.add_argument(
+        "--confirm-owner-approval",
+        action="store_true",
+        help="Подтверждение владельца: без него issue не создаются",
+    )
+    p_create.add_argument("--dry-run", action="store_true", help="Показать план без создания issue")
+    p_create.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        default=argparse.SUPPRESS,
+        help="Вывод в формате JSON",
+    )
+
     return parser
+
+
+def _add_debug_common_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--device", default=None, help="ADB serial устройства (по умолчанию 127.0.0.1:<local_adb_port>)")
+    parser.add_argument(
+        "--package",
+        dest="debug_package",
+        default=DEFAULT_DEBUG_PACKAGE,
+        help=f"Пакет debug-сборки (по умолчанию: {DEFAULT_DEBUG_PACKAGE})",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        default=argparse.SUPPRESS,
+        help="Вывод в формате JSON",
+    )
 
 
 def _emit(payload: dict[str, Any], *, as_json: bool, stream: TextIO) -> None:
@@ -168,6 +268,15 @@ def run_cli(
 
     if args.command == "ui-driver":
         return _run_ui_driver_cli(args, out=out, err=err)
+
+    if args.command == "debug":
+        return _run_debug_cli(args, out=out, err=err)
+
+    if args.command == "report":
+        return _run_report_cli(args, out=out, err=err)
+
+    if args.command == "issues":
+        return _run_issues_cli(args, out=out, err=err)
 
     try:
         adapter_kwargs: dict[str, Any] = {}
@@ -318,6 +427,147 @@ def _run_ui_driver_cli(args: argparse.Namespace, *, out: TextIO, err: TextIO) ->
 
         raise StandError(f"Неизвестная подкоманда ui-driver: {args.ui_driver_command}")
     except StandError as exc:
+        if args.as_json:
+            _emit({"ok": False, "error": str(exc)}, as_json=True, stream=out)
+        else:
+            err.write(f"Ошибка: {exc}\n")
+        return 1
+
+
+def _run_debug_cli(args: argparse.Namespace, *, out: TextIO, err: TextIO) -> int:
+    device_id = args.device or f"127.0.0.1:{args.local_adb_port}"
+    try:
+        client = DebugHooksClient(
+            device=device_id,
+            package=args.debug_package,
+            adb_bin=args.adb_bin,
+        )
+        if args.debug_command == "navigate":
+            target = args.target_opt or args.target
+            if not target:
+                raise StandError("Укажите целевой экран: `debug navigate --target <target>`")
+            res = client.navigate(target)
+        elif args.debug_command == "mock-state":
+            res = client.mock_state(args.preset, error_message=args.error_message)
+        elif args.debug_command == "reset-state":
+            res = client.reset_state()
+        elif args.debug_command == "dump-diagnostics":
+            res = client.dump_diagnostics(args.output_path)
+        else:
+            raise StandError(f"Неизвестная подкоманда debug: {args.debug_command}")
+
+        _emit(res.to_dict(), as_json=args.as_json, stream=out)
+        return 0
+    except StandError as exc:
+        if args.as_json:
+            _emit({"ok": False, "error": str(exc)}, as_json=True, stream=out)
+        else:
+            err.write(f"Ошибка: {exc}\n")
+        return 1
+
+
+def _run_report_cli(args: argparse.Namespace, *, out: TextIO, err: TextIO) -> int:
+    try:
+        report = load_verification_report(args.input)
+        plan = None
+        if args.open_issues:
+            plan = deduplicate_findings(report.findings, load_open_issues(args.open_issues))
+
+        markdown = render_markdown_report(report, dedup_plan=plan)
+        summary = render_chat_summary(report, dedup_plan=plan)
+
+        output_path: str | None = None
+        if args.output:
+            path = Path(args.output)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(markdown, encoding="utf-8")
+            output_path = str(path)
+
+        if args.as_json:
+            _emit(
+                {
+                    "ok": True,
+                    "verdict": report.verdict,
+                    "output": output_path,
+                    "chat_summary": summary,
+                    "markdown": markdown,
+                },
+                as_json=True,
+                stream=out,
+            )
+        elif args.chat_summary:
+            out.write(summary + "\n")
+        elif output_path is None:
+            out.write(markdown)
+        else:
+            out.write(f"Отчёт сохранён: {output_path}\n")
+        return 0
+    except (StandError, ValueError, OSError, json.JSONDecodeError) as exc:
+        if args.as_json:
+            _emit({"ok": False, "error": str(exc)}, as_json=True, stream=out)
+        else:
+            err.write(f"Ошибка: {exc}\n")
+        return 1
+
+
+def _resolve_cli_open_issues(args: argparse.Namespace, *, allow_fetch: bool):
+    if args.open_issues:
+        return load_open_issues(args.open_issues)
+    if allow_fetch and getattr(args, "fetch_open", False):
+        return fetch_open_issues(args.repo)
+    if allow_fetch and getattr(args, "repo", None):
+        return fetch_open_issues(args.repo)
+    raise StandError("Укажите --open-issues <file.json> или --repo <owner/repo>")
+
+
+def _run_issues_cli(args: argparse.Namespace, *, out: TextIO, err: TextIO) -> int:
+    try:
+        report = load_verification_report(args.input)
+
+        if args.issues_command == "dedup":
+            issues = _resolve_cli_open_issues(args, allow_fetch=True)
+            plan = deduplicate_findings(report.findings, issues)
+            if args.as_json:
+                _emit(plan.to_dict(), as_json=True, stream=out)
+            else:
+                out.write(plan.render_markdown() + "\n")
+            return 0
+
+        if args.issues_command == "create":
+            approved_ids = [
+                item.strip() for item in (args.approve or "").split(",") if item.strip()
+            ]
+            if not args.confirm_owner_approval and not args.dry_run:
+                raise OwnerApprovalRequiredError(
+                    "Создание GitHub Issues требует явного подтверждения владельца: "
+                    "добавьте --confirm-owner-approval (или используйте --dry-run для плана)"
+                )
+
+            issues = _resolve_cli_open_issues(args, allow_fetch=True)
+            plan = deduplicate_findings(report.findings, issues)
+            result = create_approved_issues(
+                plan,
+                repo=args.repo,
+                owner_approved=args.confirm_owner_approval,
+                approved_finding_ids=approved_ids,
+                approve_all_new=args.approve_all_new,
+                report_meta=report,
+                dry_run=args.dry_run,
+            )
+            if args.as_json:
+                _emit(result.to_dict(), as_json=True, stream=out)
+            elif args.dry_run:
+                out.write("План создания GitHub Issues (dry-run, ничего не создано):\n")
+                for item in result.planned:
+                    out.write(f"- {item.finding.id}: {item.title}\n")
+            else:
+                out.write("Созданы GitHub Issues:\n")
+                for created in result.created:
+                    out.write(f"- {created.finding_id}: {created.url or created.title}\n")
+            return 0
+
+        raise StandError(f"Неизвестная подкоманда issues: {args.issues_command}")
+    except (StandError, ValueError, OSError, json.JSONDecodeError) as exc:
         if args.as_json:
             _emit({"ok": False, "error": str(exc)}, as_json=True, stream=out)
         else:

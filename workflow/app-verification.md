@@ -26,6 +26,13 @@
   - `python3 scripts/app-verify.py --json ui-driver doctor [--probe-mcp] [--require-device]` — проверить локальный `adb`, `ANDROID_HOME`, Node/`npx` и (с `--probe-mcp`) выполнить реальное MCP-рукопожатие и опрос устройств; при устаревшем фоновом демоне `mobilecli` автоматически перезапускает его, если `adb devices` уже видит устройство `online`.
   - `python3 scripts/app-verify.py ui-driver serve [--listen <host:port>]` — запустить `@mobilenext/mobile-mcp` в режиме `--stdio` (по умолчанию) или Streamable HTTP с гарантированным окружением.
   - `python3 scripts/app-verify.py --json ui-driver call <tool> [--args-json '<json>']` — выполнить одиночный вызов MCP-инструмента (автоматически подставляет `device=127.0.0.1:15565`, если он не указан явно).
+- **White-box debug-хуки (`ru.rumap.android.debug`):** вызов `am broadcast` к `DebugVerificationReceiver` debug-сборки (в `release` физически отсутствует):
+  - `python3 scripts/app-verify.py --json debug navigate --target <target>` — перейти на экран/диалог (`home`, `main`, `check`, `settings`, `region`, `anchors`, `diaglog`, `benchmark`, `calibration`, `calibration_advanced`, `update`, `advanced`, `help`, `battery_onboarding`, `region_onboarding`, `mandatory_update`).
+  - `python3 scripts/app-verify.py --json debug mock-state --preset <preset> [--error-message <msg>]` — мок состояния (`clear`, `none`, `offline`, `degraded_cellular`, `vpn_active`, `center_sync_error`).
+  - `python3 scripts/app-verify.py --json debug reset-state` — сбросить локальную БД, настройки и debug-overlay.
+  - `python3 scripts/app-verify.py --json debug dump-diagnostics [--output-path <path>]` — read-only дамп диагностики приложения.
+  - Все подкоманды принимают `--device <serial>` и `--package <pkg>` (по умолчанию `ru.rumap.android.debug`).
+- **Отчёт и GitHub Issues:** `report` рендерит Markdown/сводку из `run.json`, `issues dedup` сверяет находки с открытыми issue, `issues create` заводит issue только после `--confirm-owner-approval` (см. ниже).
 
 ## Конфигурация UI-драйвера и переменные окружения
 
@@ -79,3 +86,33 @@ python3 scripts/app-verify.py --json stop
    - Найденные проблемы с severity (`Blocker` / `Major` / `Minor` / `UX polish`), шагами воспроизведения, скриншотами и фрагментами `logcat`.
    - Оценка по рубрике: **Функционал / UI / UX / Стабильность**.
 4. Предложить владельцу список кандидатов в GitHub Issues (после дедупликации по открытым issue). **Заводить issue только после явного «ок» владельца.**
+
+Полный пошаговый протокол прогона (предусловия, чеклист сценариев, обязательный cleanup, схема `run.json`, owner-gate) зафиксирован в скилле [skills/app-verifier/SKILL.md](../skills/app-verifier/SKILL.md).
+
+## Отчёт, дедупликация и owner-gated Issues
+
+```bash
+# 1. Markdown-отчёт и краткая сводка для чата T3 (run.json — результат прогона)
+python3 scripts/app-verify.py report --input .scratch/app-verify-<ts>/run.json \
+  --open-issues .scratch/app-verify-<ts>/open-issues.json \
+  --output .scratch/app-verify-<ts>/report.md
+python3 scripts/app-verify.py report --input .scratch/app-verify-<ts>/run.json --chat-summary
+
+# 2. Дедупликация по открытым issue (из файла или напрямую через gh)
+python3 scripts/app-verify.py --json issues dedup --input .scratch/app-verify-<ts>/run.json \
+  --repo <owner/repo>
+
+# 3. План без создания (dry-run) и создание строго после подтверждения владельца
+python3 scripts/app-verify.py --json issues create --input .scratch/app-verify-<ts>/run.json \
+  --repo <owner/repo> --open-issues .scratch/app-verify-<ts>/open-issues.json \
+  --approve-all-new --dry-run
+python3 scripts/app-verify.py --json issues create --input .scratch/app-verify-<ts>/run.json \
+  --repo <owner/repo> --open-issues .scratch/app-verify-<ts>/open-issues.json \
+  --approve M1,U1 --confirm-owner-approval
+```
+
+Правила вердикта: `BLOCKED` при крашах/ANR/находках `Blocker`, `CONDITIONAL` при `Major`
+или любой оси рубрики `<= 3`, иначе `READY`. Дедупликатор делит находки на точные дубли
+(пропускаются), возможные дубли (не создаются по умолчанию) и новые кандидаты. Без
+`--confirm-owner-approval` команда `issues create` завершается ошибкой и не вызывает
+`gh issue create`; `--dry-run` только показывает план.
