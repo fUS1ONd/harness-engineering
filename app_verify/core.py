@@ -147,7 +147,7 @@ class PlatformAdapter(ABC):
         """Возвращает текущее состояние стенда и доступность цели."""
 
     @abstractmethod
-    def install(self, artifact_path: Path) -> InstallResult:
+    def install(self, artifact_path: Path, **options: Any) -> InstallResult:
         """Устанавливает проверяемый артефакт (например, debug APK)."""
 
     @abstractmethod
@@ -166,6 +166,10 @@ class PlatformAdapter(ABC):
         package: str | None = None,
     ) -> LogReport:
         """Собирает логи и выделяет критические сбои (crash/ANR)."""
+
+    def save_snapshot(self, name: str | None = None) -> StandStatus:
+        """Сохраняет базовый снапшот стенда (опционально для платформ с поддержкой снапшотов)."""
+        raise StandError(f"Платформа '{self.platform}' не поддерживает snapshot-save")
 
 
 AdapterFactory = Callable[..., PlatformAdapter]

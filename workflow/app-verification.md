@@ -11,6 +11,7 @@
 ## Ручки агента
 
 - **Тонкий CLI стенда (`scripts/app-verify.py`):** платформо-независимый верхний уровень (`--platform android`, расширяемый под веб/боты) + адаптер Android KVM на `ssh home` (жёсткий инвариант HDD `/mnt/data/android/`):
+  - `python3 scripts/app-verify.py --json platforms` — список зарегистрированных платформенных адаптеров.
   - `python3 scripts/app-verify.py --json prepare` — проверить HDD-инвариант, SDK, AVD и снапшот `clean-base`.
   - `python3 scripts/app-verify.py --json start` (`up`) — поднять или откатить эмулятор к `clean-base`, открыть SSH-туннель ADB (`127.0.0.1:15565`) и дождаться состояния `device`.
   - `python3 scripts/app-verify.py --json status` — статус эмулятора, туннеля и локального `adb`.
@@ -18,6 +19,7 @@
   - `python3 scripts/app-verify.py --json launch <package>` — запустить приложение (`am start -W`).
   - `python3 scripts/app-verify.py --json screenshot <out.png>` — снять и провалидировать PNG-скриншот.
   - `python3 scripts/app-verify.py --json logcat [--package <pkg>] [--output <log.txt>] [--fail-on-error]` — выгрузить `logcat` и проверить инвариант `0 crash / 0 ANR`.
+  - `python3 scripts/app-verify.py --json snapshot-save [name]` — сохранить чистый базовый снапшот на HDD.
   - `python3 scripts/app-verify.py --json stop` (`down`) — остановить эмулятор и закрыть SSH-туннель.
 - **UI-драйвер (`@mobilenext/mobile-mcp` или `Maestro`):** чтение accessibility-дерева, тапы, ввод, свайпы, снятие скриншотов.
 

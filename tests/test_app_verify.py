@@ -5,10 +5,11 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
-from typing import Mapping
+from typing import Any, Mapping
 
 from app_verify.android import (
     ALLOWED_HDD_ROOT,
@@ -59,8 +60,14 @@ class _DummyAdapter(PlatformAdapter):
     def status(self) -> StandStatus:
         return StandStatus(platform="dummy", state="running", target_id="d1", endpoint="local")
 
-    def install(self, artifact_path: Path) -> InstallResult:
-        return InstallResult(platform="dummy", artifact=str(artifact_path), target_id="d1", ok=True)
+    def install(self, artifact_path: Path, **options: Any) -> InstallResult:
+        return InstallResult(
+            platform="dummy",
+            artifact=str(artifact_path),
+            target_id="d1",
+            ok=True,
+            details=dict(options),
+        )
 
     def launch(self, target: str, activity: str | None = None) -> LaunchResult:
         return LaunchResult(platform="dummy", app_id=target, component=activity or target, ok=True)
@@ -124,6 +131,9 @@ class HddInvariantTests(unittest.TestCase):
             "/mnt/data",
             "/mnt/data/android2",
             "/mnt/data/android/../docker",
+            "/mnt/data/android/$(id)",
+            '/mnt/data/android/"bad"',
+            "/mnt/data/android/sub\nline",
             "mnt/data/android",
             "",
         ]
@@ -403,6 +413,103 @@ class AndroidKvmAdapterTests(unittest.TestCase):
             with self.assertRaises(StandError):
                 adapter.screenshot(Path(td) / "bad.png")
 
+    def test_remote_script_checks_hdd_mount_before_mkdir_and_quotes_safely(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._make_config(td)
+            adapter = AndroidKvmAdapter(cfg, runner=_FakeRunner(lambda *_a: CommandResult(0)))
+            script = adapter.build_remote_script("echo ok")
+            mount_pos = script.index('df --output=target "$CHECK_PATH"')
+            mkdir_pos = script.index('mkdir -p "$ANDROID_HOME"')
+            self.assertLess(mount_pos, mkdir_pos)
+            self.assertIn("printf 'HDD_INVARIANT_VIOLATION: %s resides on root SSD /\\n'", script)
+            self.assertIn("--", adapter.build_ssh_command())
+            self.assertIn("--", adapter.build_tunnel_start_command())
+            self.assertIn("--", adapter.build_tunnel_control_command("check"))
+
+    def test_config_rejects_invalid_ssh_host_and_remote_adb_port(self) -> None:
+        with self.assertRaises(StandError):
+            AndroidStandConfig(ssh_host="-oProxyCommand=id")
+        with self.assertRaises(StandError):
+            AndroidStandConfig(remote_adb_server_port=80)
+
+    def test_prepare_status_and_save_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._make_config(td)
+
+            def handler(args: list[str], inp: bytes | None, _timeout: float | None) -> CommandResult:
+                script = (inp or b"").decode("utf-8")
+                if args[0] == "ssh" and "bash" in args and "has_sdkmanager=" in script:
+                    return CommandResult(
+                        0,
+                        b"mount_source=/dev/sdb1\nmount_target=/mnt/data\nhas_emulator=1\n"
+                        b"has_adb=1\nhas_sdkmanager=1\nhas_avd=1\nhas_snapshot=1\nhas_kvm=1\n",
+                    )
+                if args[0] == "ssh" and "bash" in args and "emu avd snapshot save" in script:
+                    return CommandResult(0, b"OK\n")
+                if args[0] == "ssh" and "bash" in args and "emu_alive=" in script:
+                    return CommandResult(0, b"emu_alive=1\nremote_adb_state=device\nboot_completed=1\n")
+                if args[0] == "ssh" and "-O" in args and "check" in args:
+                    return CommandResult(0)
+                if args[0] == cfg.adb_bin and args[1] == "devices":
+                    return CommandResult(0, b"List of devices attached\n127.0.0.1:15565\tdevice\n")
+                raise AssertionError(f"Unexpected call: {args}")
+
+            adapter = AndroidKvmAdapter(cfg, runner=_FakeRunner(handler))
+            prep = adapter.prepare()
+            self.assertEqual(prep.state, "ready")
+            self.assertEqual(prep.snapshot, "clean-base")
+
+            st = adapter.status()
+            self.assertEqual(st.state, "running")
+            self.assertTrue(st.details["boot_completed"])
+
+            snap = adapter.save_snapshot("clean-base")
+            self.assertEqual(snap.state, "snapshot-saved")
+            self.assertEqual(snap.snapshot, "clean-base")
+
+    def test_status_propagates_hdd_invariant_and_reports_ssh_error(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._make_config(td)
+
+            adapter_hdd = AndroidKvmAdapter(
+                cfg,
+                runner=_FakeRunner(lambda *_a: CommandResult(42, stderr=b"HDD_INVARIANT_VIOLATION")),
+            )
+            with self.assertRaises(HddInvariantError):
+                adapter_hdd.status()
+
+            def ssh_fail_handler(args: list[str], _inp: bytes | None, _timeout: float | None) -> CommandResult:
+                if args[0] == "ssh" and "bash" in args:
+                    return CommandResult(255, stderr=b"ssh: connect to host home port 22: Connection refused\n")
+                if args[0] == "ssh" and "-O" in args:
+                    return CommandResult(255)
+                if args[0] == cfg.adb_bin and args[1] == "devices":
+                    return CommandResult(0, b"List of devices attached\n")
+                raise AssertionError(f"Unexpected call: {args}")
+
+            st = AndroidKvmAdapter(cfg, runner=_FakeRunner(ssh_fail_handler)).status()
+            self.assertEqual(st.state, "error")
+            self.assertEqual(st.details["remote_returncode"], 255)
+            self.assertIn("Connection refused", st.details["remote_error"])
+
+    def test_start_fails_on_missing_snapshot_when_reset_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._make_config(td)
+
+            def handler(args: list[str], inp: bytes | None, _timeout: float | None) -> CommandResult:
+                if args[0] == cfg.adb_bin and args[1] == "disconnect":
+                    return CommandResult(0)
+                if args[0] == "ssh" and "bash" in args:
+                    script = (inp or b"").decode("utf-8")
+                    self.assertIn("SNAPSHOT_NOT_FOUND", script)
+                    self.assertIn("exit 43", script)
+                    return CommandResult(43, stderr=b"SNAPSHOT_NOT_FOUND: missing-snap\n")
+                raise AssertionError(f"Unexpected call: {args}")
+
+            adapter = AndroidKvmAdapter(cfg, runner=_FakeRunner(handler))
+            with self.assertRaises(StandError):
+                adapter.start(snapshot="missing-snap", reset=True)
+
 
 class CliTests(unittest.TestCase):
     def test_default_registry_contains_android(self) -> None:
@@ -461,6 +568,43 @@ class CliTests(unittest.TestCase):
         payload = json.loads(out.getvalue())
         self.assertFalse(payload["ok"])
         self.assertEqual(payload["crash_count"], 1)
+
+    def test_cli_snapshot_save_rejects_unsupported_platform(self) -> None:
+        reg = AdapterRegistry()
+        reg.register("dummy", lambda: _DummyAdapter())
+        out = io.StringIO()
+        err = io.StringIO()
+        rc = run_cli(["--platform", "dummy", "--json", "snapshot-save"], registry=reg, stdout=out, stderr=err)
+        self.assertEqual(rc, 1)
+        payload = json.loads(out.getvalue())
+        self.assertIn("snapshot-save", payload["error"])
+
+
+@unittest.skipUnless(
+    os.environ.get("APP_VERIFY_LIVE_SMOKE") == "1",
+    "Opt-in интеграционный smoke-тест Шва 1 против живого эмулятора на ssh home (APP_VERIFY_LIVE_SMOKE=1)",
+)
+class LiveAndroidStandSmokeTests(unittest.TestCase):
+    def test_live_prepare_start_screenshot_logcat_stop(self) -> None:
+        adapter = AndroidKvmAdapter()
+        prep = adapter.prepare()
+        self.assertEqual(prep.state, "ready")
+        self.assertNotEqual(prep.details.get("mount_target"), "/")
+        try:
+            started = adapter.start(reset=True)
+            self.assertEqual(started.state, "running")
+            st = adapter.status()
+            self.assertEqual(st.state, "running")
+            with tempfile.TemporaryDirectory() as td:
+                shot_path = Path(td) / "smoke.png"
+                shot = adapter.screenshot(shot_path)
+                self.assertTrue(shot.valid)
+                self.assertTrue(shot_path.read_bytes().startswith(PNG_SIGNATURE))
+                rep = adapter.collect_logs()
+                self.assertGreater(rep.details["line_count"], 0)
+        finally:
+            stopped = adapter.stop()
+            self.assertEqual(stopped.state, "stopped")
 
 
 if __name__ == "__main__":

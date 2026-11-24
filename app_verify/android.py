@@ -104,6 +104,10 @@ def validate_hdd_root(path: str) -> str:
         raise HddInvariantError(
             f"Путь Android-стенда обязан быть абсолютным под {ALLOWED_HDD_ROOT}, получено: {path!r}"
         )
+    if any(ch not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._/-" for ch in path):
+        raise HddInvariantError(
+            f"Путь Android-стенда содержит недопустимые символы: {path!r}"
+        )
     parts = [p for p in path.split("/") if p]
     if ".." in parts:
         raise HddInvariantError(
@@ -230,12 +234,16 @@ class AndroidStandConfig:
 
     def __post_init__(self) -> None:
         validate_hdd_root(self.remote_root)
+        if not self.ssh_host or self.ssh_host.startswith("-"):
+            raise StandError(f"Некорректный ssh_host: {self.ssh_host!r}")
         if self.console_port % 2 != 0 or self.console_port < 5554:
             raise StandError(
                 f"console_port эмулятора должен быть чётным >= 5554, получено: {self.console_port}"
             )
         if not (1024 <= self.local_adb_port <= 65535):
             raise StandError(f"Некорректный local_adb_port: {self.local_adb_port}")
+        if not (1024 <= self.remote_adb_server_port <= 65535):
+            raise StandError(f"Некорректный remote_adb_server_port: {self.remote_adb_server_port}")
 
     @property
     def remote_adb_port(self) -> int:
@@ -293,6 +301,7 @@ class AndroidKvmAdapter(PlatformAdapter):
             "BatchMode=yes",
             "-o",
             "ConnectTimeout=10",
+            "--",
             self.config.ssh_host,
             "bash",
             "-s",
@@ -303,18 +312,23 @@ class AndroidKvmAdapter(PlatformAdapter):
         exports = "\n".join(f"export {k}={shlex.quote(v)}" for k, v in env.items())
         root_q = shlex.quote(self.config.remote_root)
         # Оборачиваем тело в функцию и вызываем с `</dev/null`, чтобы `adb shell` не съел stdin скрипта `bash -s`.
+        # Точку монтирования проверяем строго ДО `mkdir -p`, чтобы при отмонтированном HDD ничего не записалось на SSD `/`.
         guard = (
             "__app_verify_main() {\n"
             "set -euo pipefail\n"
             f"{exports}\n"
+            f"CHECK_PATH={root_q}\n"
+            'while [ ! -e "$CHECK_PATH" ] && [ "$CHECK_PATH" != "/" ]; do\n'
+            '  CHECK_PATH=$(dirname "$CHECK_PATH")\n'
+            "done\n"
+            'MOUNT_TGT=$(df --output=target "$CHECK_PATH" | tail -n 1 | xargs)\n'
+            'if [ "$MOUNT_TGT" = "/" ]; then\n'
+            f"  printf 'HDD_INVARIANT_VIOLATION: %s resides on root SSD /\\n' {root_q} >&2\n"
+            "  exit 42\n"
+            "fi\n"
             f'mkdir -p "$ANDROID_HOME" "$ANDROID_USER_HOME" "$ANDROID_AVD_HOME" '
             f'"$TMPDIR" "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME" "$HOME" "$XDG_RUNTIME_DIR" '
             f"{shlex.quote(posixpath.join(self.config.remote_root, 'logs'))}\n"
-            f'MOUNT_TGT=$(df --output=target {root_q} | tail -n 1 | xargs)\n'
-            'if [ "$MOUNT_TGT" = "/" ]; then\n'
-            f'  echo "HDD_INVARIANT_VIOLATION: {self.config.remote_root} resides on root SSD /" >&2\n'
-            "  exit 42\n"
-            "fi\n"
         )
         return guard + body.lstrip("\n") + "\n}\n__app_verify_main </dev/null\n"
 
@@ -359,6 +373,7 @@ class AndroidKvmAdapter(PlatformAdapter):
             "ServerAliveCountMax=3",
             "-L",
             f"127.0.0.1:{self.config.local_adb_port}:127.0.0.1:{self.config.remote_adb_port}",
+            "--",
             self.config.ssh_host,
         ]
 
@@ -369,6 +384,7 @@ class AndroidKvmAdapter(PlatformAdapter):
             str(self.config.control_socket),
             "-O",
             control_op,
+            "--",
             self.config.ssh_host,
         ]
 
@@ -380,12 +396,7 @@ class AndroidKvmAdapter(PlatformAdapter):
         if self._is_tunnel_alive():
             return
         self.config.ssh_control_dir.mkdir(parents=True, exist_ok=True)
-        sock = self.config.control_socket
-        if sock.exists():
-            try:
-                sock.unlink()
-            except OSError:
-                pass
+        self.config.control_socket.unlink(missing_ok=True)
         res = self.runner.run(self.build_tunnel_start_command(), timeout=15.0)
         if res.returncode != 0:
             raise StandError(
@@ -395,12 +406,7 @@ class AndroidKvmAdapter(PlatformAdapter):
 
     def _close_tunnel(self) -> None:
         self.runner.run(self.build_tunnel_control_command("exit"), timeout=10.0)
-        sock = self.config.control_socket
-        if sock.exists():
-            try:
-                sock.unlink()
-            except OSError:
-                pass
+        self.config.control_socket.unlink(missing_ok=True)
 
     def _connect_local_adb(self) -> None:
         deadline = self._monotonic() + self.config.adb_timeout_s
@@ -446,6 +452,8 @@ echo "has_snapshot=$HAS_SNAP"
 echo "has_kvm=$HAS_KVM"
 """
         res = self._run_remote(body)
+        if res.returncode == 42:
+            raise HddInvariantError(res.stderr_text.strip() or "Нарушен HDD-инвариант на удалённом хосте")
         if res.returncode != 0:
             raise StandError(f"Проверка стенда на {self.config.ssh_host} не удалась: {res.stderr_text.strip()}")
         info = _parse_kv_lines(res.stdout_text)
@@ -505,6 +513,11 @@ wait_boot() {{
 }}
 
 RESTORED="none"
+if [ "{reset_flag}" = "1" ] && [ -n {snap_q} ] && [ "$HAS_SNAP" != "1" ]; then
+  printf 'SNAPSHOT_NOT_FOUND: %s\n' {snap_q} >&2
+  exit 43
+fi
+
 if is_running; then
   if [ "{reset_flag}" = "1" ] && [ "$HAS_SNAP" = "1" ]; then
     if "$ADB" -s {serial_q} emu avd snapshot load {snap_q} >/dev/null 2>&1 && wait_boot; then
@@ -520,7 +533,7 @@ if is_running; then
 fi
 
 if [ "$RESTORED" = "none" ]; then
-  pkill -f "qemu-system.*-port {self.config.console_port}" 2>/dev/null || true
+  pkill -f "qemu-system.*-port {self.config.console_port}([[:space:]]|$)" 2>/dev/null || true
   sleep 1
   SNAP_ARGS=("-no-snapshot-save")
   if [ "$HAS_SNAP" = "1" ]; then
@@ -543,9 +556,15 @@ if [ "$RESTORED" = "none" ]; then
 fi
 
 echo "mode=$RESTORED"
-echo "snapshot_used=$([ "$HAS_SNAP" = "1" ] && echo {snap_q} || echo none)"
+if [ "$RESTORED" = "snapshot-load" ] || [ "$RESTORED" = "boot-snapshot" ]; then
+  echo "snapshot_used="{snap_q}
+else
+  echo "snapshot_used=none"
+fi
 """
         res = self._run_remote(body, timeout=self.config.boot_timeout_s + 30.0)
+        if res.returncode == 42:
+            raise HddInvariantError(res.stderr_text.strip() or "Нарушен HDD-инвариант на удалённом хосте")
         if res.returncode != 0:
             raise StandError(
                 f"Не удалось запустить эмулятор на {self.config.ssh_host}: "
@@ -582,18 +601,20 @@ if [ -x "$ADB" ]; then
   "$ADB" -s {serial_q} emu kill >/dev/null 2>&1 || true
 fi
 for _ in $(seq 1 15); do
-  if ! pgrep -f "qemu-system.*-port {self.config.console_port}" >/dev/null 2>&1; then
+  if ! pgrep -f "qemu-system.*-port {self.config.console_port}([[:space:]]|$)" >/dev/null 2>&1; then
     break
   fi
   sleep 1
 done
-pkill -f "qemu-system.*-port {self.config.console_port}" 2>/dev/null || true
+pkill -f "qemu-system.*-port {self.config.console_port}([[:space:]]|$)" 2>/dev/null || true
 if [ -x "$ADB" ]; then
   "$ADB" kill-server >/dev/null 2>&1 || true
 fi
 echo "stopped=1"
 """
         res = self._run_remote(body, timeout=40.0)
+        if res.returncode == 42:
+            raise HddInvariantError(res.stderr_text.strip() or "Нарушен HDD-инвариант на удалённом хосте")
         if res.returncode != 0:
             raise StandError(f"Ошибка остановки эмулятора на {self.config.ssh_host}: {res.stderr_text.strip()}")
 
@@ -611,7 +632,7 @@ echo "stopped=1"
         serial_q = shlex.quote(self.config.remote_serial)
         body = f"""
 ADB="$ANDROID_HOME/platform-tools/adb"
-EMU_ALIVE=$(pgrep -f "qemu-system.*-port {self.config.console_port}" >/dev/null 2>&1 && echo 1 || echo 0)
+EMU_ALIVE=$(pgrep -f "qemu-system.*-port {self.config.console_port}([[:space:]]|$)" >/dev/null 2>&1 && echo 1 || echo 0)
 REMOTE_STATE="stopped"
 BOOT_COMPLETED="0"
 if [ "$EMU_ALIVE" = "1" ] && [ -x "$ADB" ]; then
@@ -625,7 +646,10 @@ echo "remote_adb_state=$REMOTE_STATE"
 echo "boot_completed=$BOOT_COMPLETED"
 """
         remote_res = self._run_remote(body)
-        remote_info = _parse_kv_lines(remote_res.stdout_text) if remote_res.returncode == 0 else {}
+        if remote_res.returncode == 42:
+            raise HddInvariantError(
+                remote_res.stderr_text.strip() or "Нарушен HDD-инвариант на удалённом хосте"
+            )
         tunnel_alive = self._is_tunnel_alive()
 
         local_state = "disconnected"
@@ -635,6 +659,27 @@ echo "boot_completed=$BOOT_COMPLETED"
                 self.config.local_serial, "disconnected"
             )
 
+        if remote_res.returncode != 0:
+            remote_error = remote_res.stderr_text.strip() or remote_res.stdout_text.strip()
+            return StandStatus(
+                platform=self.platform,
+                state="error",
+                target_id=self.config.local_serial,
+                endpoint=f"{self.config.ssh_host}:{self.config.remote_adb_port} -> {self.config.local_serial}",
+                snapshot=self.config.snapshot_name,
+                details={
+                    "remote_emu_alive": False,
+                    "remote_adb_state": "error",
+                    "boot_completed": False,
+                    "tunnel_alive": tunnel_alive,
+                    "local_adb_state": local_state,
+                    "remote_root": self.config.remote_root,
+                    "remote_returncode": remote_res.returncode,
+                    "remote_error": remote_error,
+                },
+            )
+
+        remote_info = _parse_kv_lines(remote_res.stdout_text)
         emu_alive = remote_info.get("emu_alive") == "1"
         booted = remote_info.get("boot_completed") == "1"
         if emu_alive and booted and tunnel_alive and local_state == "device":
@@ -695,7 +740,7 @@ echo "boot_completed=$BOOT_COMPLETED"
                     "--brief",
                     "-c",
                     "android.intent.category.LAUNCHER",
-                    target,
+                    shlex.quote(target),
                 ]
             )
             if resolve_res.returncode != 0:
@@ -714,7 +759,7 @@ echo "boot_completed=$BOOT_COMPLETED"
                 )
             component = candidates[-1]
 
-        res = self._run_local_adb(["shell", "am", "start", "-W", "-n", component])
+        res = self._run_local_adb(["shell", "am", "start", "-W", "-n", shlex.quote(component)])
         combined = (res.stdout_text + "\n" + res.stderr_text).strip()
         if res.returncode != 0 or "Error:" in combined or "Exception" in combined:
             raise StandError(f"Не удалось запустить {component}: {combined}")
@@ -807,6 +852,8 @@ ADB="$ANDROID_HOME/platform-tools/adb"
 "$ADB" -s {serial_q} emu avd snapshot save {snap_q}
 """
         res = self._run_remote(body, timeout=60.0)
+        if res.returncode == 42:
+            raise HddInvariantError(res.stderr_text.strip() or "Нарушен HDD-инвариант на удалённом хосте")
         if res.returncode != 0:
             raise StandError(
                 f"Не удалось сохранить снапшот {snap}: {res.stderr_text.strip() or res.stdout_text.strip()}"

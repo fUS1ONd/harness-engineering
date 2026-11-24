@@ -134,20 +134,22 @@ def run_cli(
         return 0
 
     try:
-        adapter = reg.create(
-            args.platform,
-            ssh_host=args.ssh_host,
-            remote_root=args.remote_root,
-            avd=args.avd,
-            snapshot=args.snapshot,
-            console_port=args.console_port,
-            local_adb_port=args.local_adb_port,
-            remote_adb_server_port=args.remote_adb_server_port,
-            adb_bin=args.adb_bin,
-            gpu_mode=args.gpu_mode,
-            boot_timeout=args.boot_timeout,
-            adb_timeout=args.adb_timeout,
-        )
+        adapter_kwargs: dict[str, Any] = {}
+        if args.platform.strip().lower() == "android":
+            adapter_kwargs = {
+                "ssh_host": args.ssh_host,
+                "remote_root": args.remote_root,
+                "avd": args.avd,
+                "snapshot": args.snapshot,
+                "console_port": args.console_port,
+                "local_adb_port": args.local_adb_port,
+                "remote_adb_server_port": args.remote_adb_server_port,
+                "adb_bin": args.adb_bin,
+                "gpu_mode": args.gpu_mode,
+                "boot_timeout": args.boot_timeout,
+                "adb_timeout": args.adb_timeout,
+            }
+        adapter = reg.create(args.platform, **adapter_kwargs)
 
         if args.command == "prepare":
             _emit(adapter.prepare().to_dict(), as_json=args.as_json, stream=out)
@@ -168,10 +170,10 @@ def run_cli(
             return 0
 
         if args.command == "install":
-            if isinstance(adapter, AndroidKvmAdapter):
-                res = adapter.install(Path(args.artifact), grant_permissions=not args.no_grant_permissions)
-            else:
-                res = adapter.install(Path(args.artifact))
+            install_opts: dict[str, Any] = {}
+            if args.no_grant_permissions:
+                install_opts["grant_permissions"] = False
+            res = adapter.install(Path(args.artifact), **install_opts)
             _emit(res.to_dict(), as_json=args.as_json, stream=out)
             return 0
 
@@ -194,8 +196,6 @@ def run_cli(
             return 0
 
         if args.command == "snapshot-save":
-            if not isinstance(adapter, AndroidKvmAdapter):
-                raise StandError(f"Платформа '{adapter.platform}' не поддерживает snapshot-save")
             res = adapter.save_snapshot(args.name)
             _emit(res.to_dict(), as_json=args.as_json, stream=out)
             return 0
