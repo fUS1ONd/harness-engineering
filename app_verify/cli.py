@@ -437,10 +437,15 @@ def _run_ui_driver_cli(args: argparse.Namespace, *, out: TextIO, err: TextIO) ->
 def _run_debug_cli(args: argparse.Namespace, *, out: TextIO, err: TextIO) -> int:
     device_id = args.device or f"127.0.0.1:{args.local_adb_port}"
     try:
+        if args.platform.strip().lower() != "android":
+            raise StandError(
+                f"Debug-хуки поддерживаются только для платформы 'android', получено: {args.platform!r}"
+            )
         client = DebugHooksClient(
             device=device_id,
             package=args.debug_package,
             adb_bin=args.adb_bin,
+            timeout_s=args.adb_timeout,
         )
         if args.debug_command == "navigate":
             target = args.target_opt or args.target
@@ -510,7 +515,7 @@ def _run_report_cli(args: argparse.Namespace, *, out: TextIO, err: TextIO) -> in
         return 1
 
 
-def _resolve_cli_open_issues(args: argparse.Namespace, *, allow_fetch: bool):
+def _resolve_cli_open_issues(args: argparse.Namespace, *, allow_fetch: bool) -> list[OpenIssue]:
     if args.open_issues:
         return load_open_issues(args.open_issues)
     if allow_fetch and getattr(args, "fetch_open", False):

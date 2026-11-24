@@ -679,6 +679,94 @@ class IssuesCliTests(unittest.TestCase):
             self.assertEqual([c["finding_id"] for c in payload["created"]], ["M1"])
             self.assertEqual(len(fake.calls), 1)
 
+    def test_scenarios_failed_blocks_verdict(self) -> None:
+        report = _ready_report(invariants=Invariants(crash_count=0, anr_count=0, scenarios_passed=5, scenarios_failed=1))
+        self.assertFalse(report.invariants.ok)
+        self.assertEqual(report.verdict, "BLOCKED")
+        self.assertTrue(any("сценариев" in reason for reason in report.blocking_reasons))
+
+    def test_long_json_strings_load_without_enametoolong(self) -> None:
+        report_json = json.dumps(_ready_report(findings=[BLOCKER, MAJOR, UX_POLISH]).to_dict(), ensure_ascii=False)
+        self.assertGreater(len(report_json), 300)
+        loaded_report = load_verification_report(report_json)
+        self.assertEqual(len(loaded_report.findings), 3)
+
+        issues_json = json.dumps([issue.to_dict() for issue in OPEN_ISSUES], ensure_ascii=False)
+        self.assertGreater(len(issues_json), 300)
+        loaded_issues = load_open_issues(issues_json)
+        self.assertEqual(len(loaded_issues), len(OPEN_ISSUES))
+
+    def test_malformed_finding_and_bool_score_return_cli_error(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            bad_finding = _ready_report().to_dict()
+            bad_finding["findings"] = [{"id": "X1"}]
+            p1 = root / "bad_finding.json"
+            p1.write_text(json.dumps(bad_finding), encoding="utf-8")
+            out = io.StringIO()
+            rc = run_cli(["--json", "report", "--input", str(p1)], stdout=out, stderr=io.StringIO())
+            self.assertEqual(rc, 1)
+            self.assertIn("title", json.loads(out.getvalue())["error"])
+
+            bad_score = _ready_report().to_dict()
+            bad_score["rubric"]["ui"]["score"] = True
+            p2 = root / "bad_score.json"
+            p2.write_text(json.dumps(bad_score), encoding="utf-8")
+            out2 = io.StringIO()
+            rc2 = run_cli(["--json", "report", "--input", str(p2)], stdout=out2, stderr=io.StringIO())
+            self.assertEqual(rc2, 1)
+            self.assertFalse(json.loads(out2.getvalue())["ok"])
+
+    def test_create_approved_issues_empty_repo_and_explicit_possible_duplicate(self) -> None:
+        possible_finding = Finding(
+            id="P1",
+            title="Диалог региона зависает при смене",
+            severity="Minor",
+            screen="region",
+        )
+        open_issue = OpenIssue(
+            number=77,
+            title="Выбор региона не сохраняется после перезапуска",
+            body="Экран region",
+            url="https://github.com/rumap/rumap-android/issues/77",
+        )
+        plan = deduplicate_findings([possible_finding], [open_issue])
+        self.assertEqual(plan.entries[0].status, "possible_duplicate")
+
+        with self.assertRaises(StandError):
+            create_approved_issues(
+                plan,
+                repo="   ",
+                owner_approved=True,
+                approved_finding_ids=["P1"],
+                runner=_FakeRunner(),
+            )
+
+        # approve_all_new skips possible_duplicate
+        fake_skip = _FakeRunner()
+        res_skip = create_approved_issues(
+            plan,
+            repo="rumap/rumap-android",
+            owner_approved=True,
+            approve_all_new=True,
+            runner=fake_skip,
+        )
+        self.assertEqual(res_skip.created, [])
+        self.assertEqual(res_skip.skipped, ["P1"])
+        self.assertEqual(fake_skip.calls, [])
+
+        # explicit owner approval of possible_duplicate is allowed
+        fake_allow = _FakeRunner()
+        res_allow = create_approved_issues(
+            plan,
+            repo="rumap/rumap-android",
+            owner_approved=True,
+            approved_finding_ids=["P1"],
+            runner=fake_allow,
+        )
+        self.assertEqual([item.finding_id for item in res_allow.created], ["P1"])
+        self.assertEqual(len(fake_allow.calls), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

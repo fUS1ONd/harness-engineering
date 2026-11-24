@@ -5,7 +5,28 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Protocol, Sequence
+
+
+class _DedupMatchLike(Protocol):
+    @property
+    def finding(self) -> Finding: ...
+
+    @property
+    def matched_issue_number(self) -> int | None: ...
+
+
+class DedupPlanProtocol(Protocol):
+    @property
+    def new(self) -> Sequence[_DedupMatchLike]: ...
+
+    @property
+    def duplicates(self) -> Sequence[_DedupMatchLike]: ...
+
+    @property
+    def possible_duplicates(self) -> Sequence[_DedupMatchLike]: ...
+
+    def render_markdown(self) -> str: ...
 
 SEVERITIES = ("Blocker", "Major", "Minor", "UX polish")
 CATEGORIES = ("functional", "ui", "ux", "stability")
@@ -161,6 +182,8 @@ class VerificationReport:
             reasons.append(f"крашей: {self.invariants.crash_count}")
         if self.invariants.anr_count > 0:
             reasons.append(f"ANR: {self.invariants.anr_count}")
+        if self.invariants.scenarios_failed > 0:
+            reasons.append(f"провалено сценариев: {self.invariants.scenarios_failed}")
         blockers = [finding.id for finding in self.findings if finding.severity == "Blocker"]
         if blockers:
             reasons.append("находки Blocker: " + ", ".join(blockers))
@@ -168,7 +191,11 @@ class VerificationReport:
 
     @property
     def verdict(self) -> str:
-        if self.invariants.crash_count > 0 or self.invariants.anr_count > 0:
+        if (
+            self.invariants.crash_count > 0
+            or self.invariants.anr_count > 0
+            or self.invariants.scenarios_failed > 0
+        ):
             return "BLOCKED"
         if any(finding.severity == "Blocker" for finding in self.findings):
             return "BLOCKED"
@@ -209,17 +236,47 @@ def _as_list(value: Any) -> list[Any]:
     return [value]
 
 
+def _strict_int(value: Any, field_name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"Поле {field_name} должно быть целым числом, получено: {value!r}")
+    return value
+
+
 def _rubric_axis_from_payload(payload: Any) -> RubricAxis:
     if isinstance(payload, RubricAxis):
         return payload
     if isinstance(payload, Mapping):
-        return RubricAxis(score=int(payload.get("score", 0)), notes=str(payload.get("notes") or ""))
+        score = _strict_int(payload.get("score"), "rubric.score")
+        return RubricAxis(score=score, notes=str(payload.get("notes") or ""))
     if isinstance(payload, int) and not isinstance(payload, bool):
         return RubricAxis(score=payload)
     raise ValueError(f"Некорректная ось рубрики: {payload!r}")
 
 
+def _finding_from_payload(item: Any, index: int) -> Finding:
+    if not isinstance(item, Mapping):
+        raise ValueError(f"Элемент findings[{index}] должен быть объектом, получено: {type(item).__name__}")
+    for key in ("id", "title", "severity"):
+        if key not in item:
+            raise ValueError(f"В findings[{index}] отсутствует обязательное поле '{key}'")
+    return Finding(
+        id=item["id"],
+        title=item["title"],
+        severity=item["severity"],
+        screen=item.get("screen", ""),
+        steps=_as_list(item.get("steps")),
+        expected=item.get("expected", ""),
+        actual=item.get("actual", ""),
+        screenshots=_as_list(item.get("screenshots")),
+        logcat_excerpt=item.get("logcat_excerpt"),
+        category=item.get("category", "functional"),
+        labels=_as_list(item.get("labels")),
+    )
+
+
 def report_from_dict(data: Mapping[str, Any]) -> VerificationReport:
+    if not isinstance(data, Mapping):
+        raise ValueError("Корневой объект отчёта должен быть JSON-объектом")
     rubric_raw = data.get("rubric") or {}
     if not isinstance(rubric_raw, Mapping):
         raise ValueError("Поле 'rubric' должно быть объектом")
@@ -233,27 +290,15 @@ def report_from_dict(data: Mapping[str, Any]) -> VerificationReport:
     if not isinstance(invariants_raw, Mapping):
         raise ValueError("Поле 'invariants' должно быть объектом")
     invariants = Invariants(
-        crash_count=int(invariants_raw.get("crash_count", 0)),
-        anr_count=int(invariants_raw.get("anr_count", 0)),
-        scenarios_passed=int(invariants_raw.get("scenarios_passed", 0)),
-        scenarios_failed=int(invariants_raw.get("scenarios_failed", 0)),
+        crash_count=_strict_int(invariants_raw.get("crash_count", 0), "invariants.crash_count"),
+        anr_count=_strict_int(invariants_raw.get("anr_count", 0), "invariants.anr_count"),
+        scenarios_passed=_strict_int(invariants_raw.get("scenarios_passed", 0), "invariants.scenarios_passed"),
+        scenarios_failed=_strict_int(invariants_raw.get("scenarios_failed", 0), "invariants.scenarios_failed"),
         details=_as_list(invariants_raw.get("details")),
     )
     findings = [
-        Finding(
-            id=item["id"],
-            title=item["title"],
-            severity=item["severity"],
-            screen=item.get("screen", ""),
-            steps=_as_list(item.get("steps")),
-            expected=item.get("expected", ""),
-            actual=item.get("actual", ""),
-            screenshots=_as_list(item.get("screenshots")),
-            logcat_excerpt=item.get("logcat_excerpt"),
-            category=item.get("category", "functional"),
-            labels=_as_list(item.get("labels")),
-        )
-        for item in _as_list(data.get("findings"))
+        _finding_from_payload(item, index)
+        for index, item in enumerate(_as_list(data.get("findings")))
     ]
     return VerificationReport(
         app=str(data.get("app") or "unknown"),
@@ -270,6 +315,16 @@ def report_from_dict(data: Mapping[str, Any]) -> VerificationReport:
     )
 
 
+def _is_existing_file(text: str) -> bool:
+    stripped = text.lstrip()
+    if stripped.startswith("{") or stripped.startswith("["):
+        return False
+    try:
+        return Path(text).exists()
+    except OSError:
+        return False
+
+
 def load_verification_report(source: Mapping[str, Any] | str | Path) -> VerificationReport:
     """Загружает отчёт из словаря, JSON-файла или JSON-строки."""
     if isinstance(source, Mapping):
@@ -277,9 +332,8 @@ def load_verification_report(source: Mapping[str, Any] | str | Path) -> Verifica
     if isinstance(source, Path):
         return report_from_dict(json.loads(source.read_text(encoding="utf-8")))
     text = str(source)
-    path = Path(text)
-    if path.exists():
-        return report_from_dict(json.loads(path.read_text(encoding="utf-8")))
+    if _is_existing_file(text):
+        return report_from_dict(json.loads(Path(text).read_text(encoding="utf-8")))
     return report_from_dict(json.loads(text))
 
 
@@ -287,13 +341,10 @@ def _markdown_cell(value: Any) -> str:
     return str(value).replace("|", "\\|").replace("\n", " ")
 
 
-def _dedup_section(dedup_plan: Any) -> str:
-    from .issues import render_dedup_markdown
-
-    return render_dedup_markdown(dedup_plan)
-
-
-def render_markdown_report(report: VerificationReport, dedup_plan: Any = None) -> str:
+def render_markdown_report(
+    report: VerificationReport,
+    dedup_plan: DedupPlanProtocol | None = None,
+) -> str:
     """Рендерит полный структурированный Markdown-отчёт прогона."""
     lines: list[str] = []
     lines.append(f"# Отчёт верификации приложения: {report.app}")
@@ -382,13 +433,16 @@ def render_markdown_report(report: VerificationReport, dedup_plan: Any = None) -
             lines.append("")
 
     if dedup_plan is not None:
-        lines.append(_dedup_section(dedup_plan))
+        lines.append(dedup_plan.render_markdown())
         lines.append("")
 
     return "\n".join(lines).rstrip() + "\n"
 
 
-def render_chat_summary(report: VerificationReport, dedup_plan: Any = None) -> str:
+def render_chat_summary(
+    report: VerificationReport,
+    dedup_plan: DedupPlanProtocol | None = None,
+) -> str:
     """Рендерит лаконичную сводку для чата T3 со ссылками на ключевые скриншоты."""
     invariants = report.invariants
     lines = [
@@ -424,9 +478,9 @@ def render_chat_summary(report: VerificationReport, dedup_plan: Any = None) -> s
         lines.append("**Ключевые скриншоты:** " + ", ".join(f"`{path}`" for path in screenshots[:3]))
 
     if dedup_plan is not None:
-        new_matches = getattr(dedup_plan, "new", [])
-        duplicates = getattr(dedup_plan, "duplicates", [])
-        possible = getattr(dedup_plan, "possible_duplicates", [])
+        new_matches = list(dedup_plan.new)
+        duplicates = list(dedup_plan.duplicates)
+        possible = list(dedup_plan.possible_duplicates)
         candidate_ids = ", ".join(match.finding.id for match in new_matches) or "—"
         lines.append(f"**Кандидаты в issue:** {candidate_ids}")
         if duplicates or possible:

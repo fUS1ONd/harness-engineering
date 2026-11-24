@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import io
 import json
+import shlex
 import tempfile
 import unittest
 from pathlib import Path
@@ -51,16 +52,15 @@ class BroadcastCommandTests(unittest.TestCase):
             device="127.0.0.1:15565",
             target="settings",
         )
+        self.assertEqual(cmd[:4], ["/opt/android-sdk/platform-tools/adb", "-s", "127.0.0.1:15565", "shell"])
+        self.assertEqual(len(cmd), 5)
+        remote = shlex.split(cmd[4])
+        self.assertNotIn("--ordered", remote)
         self.assertEqual(
-            cmd,
+            remote,
             [
-                "/opt/android-sdk/platform-tools/adb",
-                "-s",
-                "127.0.0.1:15565",
-                "shell",
                 "am",
                 "broadcast",
-                "--ordered",
                 "-a",
                 ACTION_VERIFICATION_COMMAND,
                 "-n",
@@ -82,39 +82,47 @@ class BroadcastCommandTests(unittest.TestCase):
             target="home",
         )
         self.assertNotIn("-s", cmd)
-        component = cmd[cmd.index("-n") + 1]
+        remote = shlex.split(cmd[-1])
+        component = remote[remote.index("-n") + 1]
         self.assertEqual(
             component,
             "ru.rumap.android.staging.debug/ru.rumap.android.debug.DebugVerificationReceiver",
         )
 
-    def test_mock_state_includes_preset_and_optional_error_message(self) -> None:
+    def test_mock_state_quotes_spaces_and_shell_metacharacters(self) -> None:
+        raw_msg = 'Центр недоступен; "503" $(id)'
         cmd = build_broadcast_command(
             "mock_state",
             adb_bin="adb",
             preset="center_sync_error",
-            error_message="Синхронизация недоступна",
+            error_message=raw_msg,
         )
-        self.assertEqual(cmd[-9:], [
-            "--es",
-            "command",
-            "mock_state",
-            "--es",
-            "preset",
-            "center_sync_error",
-            "--es",
-            "error_message",
-            "Синхронизация недоступна",
-        ])
+        remote = shlex.split(cmd[-1])
+        self.assertEqual(
+            remote[-9:],
+            [
+                "--es",
+                "command",
+                "mock_state",
+                "--es",
+                "preset",
+                "center_sync_error",
+                "--es",
+                "error_message",
+                raw_msg,
+            ],
+        )
 
     def test_reset_state_and_dump_diagnostics_extras(self) -> None:
-        reset = build_broadcast_command("reset_state", adb_bin="adb")
+        reset = shlex.split(build_broadcast_command("reset_state", adb_bin="adb")[-1])
         self.assertEqual(reset[-3:], ["--es", "command", "reset_state"])
 
-        dump = build_broadcast_command(
-            "dump_diagnostics",
-            adb_bin="adb",
-            output_path="/data/user/0/ru.rumap.android.debug/cache/diag.json",
+        dump = shlex.split(
+            build_broadcast_command(
+                "dump_diagnostics",
+                adb_bin="adb",
+                output_path="/data/user/0/ru.rumap.android.debug/cache/my diag.json",
+            )[-1]
         )
         self.assertEqual(
             dump[-6:],
@@ -124,13 +132,13 @@ class BroadcastCommandTests(unittest.TestCase):
                 "dump_diagnostics",
                 "--es",
                 "output_path",
-                "/data/user/0/ru.rumap.android.debug/cache/diag.json",
+                "/data/user/0/ru.rumap.android.debug/cache/my diag.json",
             ],
         )
 
     def test_cli_style_command_aliases_are_normalized(self) -> None:
-        cmd = build_broadcast_command("mock-state", adb_bin="adb", preset="offline")
-        self.assertIn("mock_state", cmd)
+        remote = shlex.split(build_broadcast_command("mock-state", adb_bin="adb", preset="offline")[-1])
+        self.assertIn("mock_state", remote)
 
     def test_invalid_target_and_preset_are_rejected_before_adb(self) -> None:
         with self.assertRaises(StandError):
@@ -299,8 +307,18 @@ class DebugHooksClientTests(unittest.TestCase):
         client = DebugHooksClient(adb_bin="adb", runner=runner)
         res = client.dump_diagnostics("/cache/diag.json")
         self.assertEqual(res.output_file, "/cache/diag.json")
-        self.assertIn("output_path", runner.calls[0])
-        self.assertIn("/cache/diag.json", runner.calls[0])
+        remote = shlex.split(runner.calls[0][-1])
+        self.assertIn("output_path", remote)
+        self.assertIn("/cache/diag.json", remote)
+
+    def test_missing_json_payload_on_result_zero_raises_stand_error(self) -> None:
+        runner = _FakeRunner(
+            CommandResult(returncode=0, stdout=b"Broadcast completed: result=0\n")
+        )
+        client = DebugHooksClient(adb_bin="adb", runner=runner)
+        with self.assertRaises(StandError) as ctx:
+            client.navigate("home")
+        self.assertIn("result=0", str(ctx.exception))
 
 
 class DebugCliTests(unittest.TestCase):
@@ -350,12 +368,27 @@ class DebugCliTests(unittest.TestCase):
         out = io.StringIO()
         err = io.StringIO()
         rc = run_cli(
-            ["--json", "debug", "mock-state", "--preset", "explode"],
+            ["--adb-bin", "/bin/true", "--json", "debug", "mock-state", "--preset", "explode"],
             stdout=out,
             stderr=err,
         )
         self.assertEqual(rc, 1)
-        self.assertFalse(json.loads(out.getvalue())["ok"])
+        payload = json.loads(out.getvalue())
+        self.assertFalse(payload["ok"])
+        self.assertIn("explode", payload["error"])
+
+    def test_cli_debug_rejects_non_android_platform(self) -> None:
+        out = io.StringIO()
+        err = io.StringIO()
+        rc = run_cli(
+            ["--platform", "web", "--adb-bin", "/bin/true", "--json", "debug", "reset-state"],
+            stdout=out,
+            stderr=err,
+        )
+        self.assertEqual(rc, 1)
+        payload = json.loads(out.getvalue())
+        self.assertFalse(payload["ok"])
+        self.assertIn("android", payload["error"])
 
 
 if __name__ == "__main__":

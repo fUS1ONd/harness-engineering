@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
 from dataclasses import asdict, dataclass
 from typing import Any
 
@@ -137,12 +138,12 @@ def build_broadcast_command(
             extras.extend(["--es", "output_path", path])
 
     component = f"{(package or DEFAULT_DEBUG_PACKAGE).strip()}/{DEBUG_RECEIVER_CLASS}"
+    remote_argv = ["am", "broadcast", "-a", ACTION_VERIFICATION_COMMAND, "-n", component, *extras]
     argv: list[str] = [adb_bin]
     if device:
         argv.extend(["-s", device])
-    # Приёмник отдаёт JSON через setResult только для ordered broadcast, поэтому --ordered обязателен.
-    argv.extend(["shell", "am", "broadcast", "--ordered", "-a", ACTION_VERIFICATION_COMMAND, "-n", component])
-    argv.extend(extras)
+    # adb shell передаёт строку в /system/bin/sh -c, поэтому аргументы с пробелами/символами экранируем.
+    argv.extend(["shell", shlex.join(remote_argv)])
     return argv
 
 
@@ -229,11 +230,9 @@ class DebugHooksClient:
         raw = result.stdout_text
         broadcast_result, payload = parse_broadcast_output(raw)
         if payload is None:
-            return DebugHookResult(
-                ok=True,
-                command=wire_command,
-                broadcast_result=broadcast_result,
-                raw_stdout=raw,
+            raise StandError(
+                f"Debug-приёмник не вернул JSON-ответ (broadcast result={broadcast_result}): "
+                "проверьте, что установлена и запущена debug-сборка приложения"
             )
         if payload.get("ok") is False:
             reason = payload.get("error") or "приёмник отклонил команду"

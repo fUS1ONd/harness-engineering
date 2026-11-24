@@ -7,9 +7,9 @@ import re
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Protocol
+from typing import Any, Iterable, Mapping
 
-from .android import CommandResult, SubprocessRunner
+from .android import CommandRunner, SubprocessRunner
 from .core import StandError
 from .report import Finding
 
@@ -89,18 +89,6 @@ _STOPWORDS = frozenset(
 
 _TOKEN_RE = re.compile(r"[0-9a-zа-яё]+")
 _IDENTIFIER_SUFFIXES = ("exception", "error", "crash", "ошибка", "падение", "краш")
-
-
-class CommandRunner(Protocol):
-    def run(
-        self,
-        args: list[str],
-        *,
-        timeout: float | None = None,
-        input_bytes: bytes | None = None,
-        env: Mapping[str, str] | None = None,
-    ) -> CommandResult:
-        ...
 
 
 class OwnerApprovalRequiredError(StandError):
@@ -417,18 +405,26 @@ def render_dedup_markdown(plan: DedupPlan) -> str:
     return "\n".join(lines).rstrip()
 
 
+def _is_existing_file(text: str) -> bool:
+    stripped = text.lstrip()
+    if stripped.startswith("{") or stripped.startswith("["):
+        return False
+    try:
+        return Path(text).exists()
+    except OSError:
+        return False
+
+
 def load_open_issues(source: Iterable[Mapping[str, Any]] | Mapping[str, Any] | str | Path) -> list[OpenIssue]:
     """Загружает открытые issue из списка, gh-JSON, файла или JSON-строки."""
     if isinstance(source, Mapping):
         raw = source.get("issues", [])
-    elif isinstance(source, (str, Path)):
-        text = str(source)
-        path = Path(text)
-        payload = json.loads(path.read_text(encoding="utf-8") if path.exists() else text)
-        if isinstance(payload, Mapping):
-            raw = payload.get("issues", [])
-        else:
-            raw = payload
+    elif isinstance(source, Path):
+        payload = json.loads(source.read_text(encoding="utf-8"))
+        raw = payload.get("issues", []) if isinstance(payload, Mapping) else payload
+    elif isinstance(source, str):
+        payload = json.loads(Path(source).read_text(encoding="utf-8") if _is_existing_file(source) else source)
+        raw = payload.get("issues", []) if isinstance(payload, Mapping) else payload
     else:
         raw = list(source)
     return [OpenIssue.from_gh_json(item) for item in raw]
@@ -579,6 +575,8 @@ def create_approved_issues(
                 "Заведение GitHub Issues требует явного списка одобренных ID (approved_finding_ids) "
                 "или approve_all_new=True"
             )
+        if not repo.strip():
+            raise StandError("Не указан репозиторий для создания GitHub Issues")
 
     known_ids = {match.finding.id for match in plan.entries}
     unknown = [item for item in approved if item not in known_ids]
@@ -588,9 +586,16 @@ def create_approved_issues(
     selected: list[DedupMatch] = []
     skipped: list[str] = []
     for match in plan.entries:
-        wants_creation = approve_all_new or match.finding.id in approved
-        if match.status != "new":
+        explicitly_approved = match.finding.id in approved
+        wants_creation = approve_all_new or explicitly_approved
+        if match.status == "duplicate":
             if wants_creation:
+                skipped.append(match.finding.id)
+            continue
+        if match.status == "possible_duplicate":
+            if explicitly_approved:
+                selected.append(match)
+            elif approve_all_new:
                 skipped.append(match.finding.id)
             continue
         if wants_creation:

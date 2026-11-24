@@ -97,8 +97,8 @@ python3 scripts/app-verify.py --json debug dump-diagnostics --output-path diag.j
 `diaglog`, `benchmark`, `calibration`, `calibration_advanced`, `update`, `advanced`,
 `help`, `battery_onboarding`, `region_onboarding`, `mandatory_update`.
 Допустимые `--preset`: `clear`, `none`, `offline`, `degraded_cellular`, `vpn_active`,
-`center_sync_error`. Если `am broadcast` вернул `ok: false` или ненулевой код, это
-дефект хука — зафиксируй его как находку.
+`center_sync_error`. Если команда `debug` завершилась с ненулевым exit code или
+`ok: false`, это дефект хука — зафиксируй его как находку.
 
 Для каждой находки сохраняй: экран, шаги воспроизведения, ожидаемое и фактическое
 поведение, скриншот и фрагмент `logcat`. Складывай артефакты в
@@ -163,30 +163,29 @@ python3 scripts/app-verify.py --json stop
 }
 ```
 
-Вердикт считается автоматически: `BLOCKED` при крашах/ANR/находках `Blocker`,
+Вердикт считается автоматически: `BLOCKED` при крашах/ANR/проваленных сценариях/находках `Blocker`,
 `CONDITIONAL` при `Major` или любой оси рубрики `<= 3`, иначе `READY`.
 
-Сгенерируй Markdown-отчёт и краткую сводку:
-
-```bash
-python3 scripts/app-verify.py report --input .scratch/app-verify-<ts>/run.json \
-  --output .scratch/app-verify-<ts>/report.md
-python3 scripts/app-verify.py report --input .scratch/app-verify-<ts>/run.json --chat-summary
-```
-
-Сверь находки с открытыми GitHub Issues:
+Выгрузи открытые GitHub Issues, сгенерируй Markdown-отчёт с секцией кандидатов и краткую сводку:
 
 ```bash
 gh issue list --repo <owner/repo> --state open --limit 200 \
   --json number,title,body,labels,url,state > .scratch/app-verify-<ts>/open-issues.json
+
+python3 scripts/app-verify.py report --input .scratch/app-verify-<ts>/run.json \
+  --open-issues .scratch/app-verify-<ts>/open-issues.json \
+  --output .scratch/app-verify-<ts>/report.md
+python3 scripts/app-verify.py report --input .scratch/app-verify-<ts>/run.json \
+  --open-issues .scratch/app-verify-<ts>/open-issues.json --chat-summary
 
 python3 scripts/app-verify.py --json issues dedup \
   --input .scratch/app-verify-<ts>/run.json \
   --open-issues .scratch/app-verify-<ts>/open-issues.json
 ```
 
-Дедупликатор делит находки на точные дубли (пропускаются), возможные дубли (не создаются
-по умолчанию) и новые кандидаты. Отправь владельцу в чат T3 сводку и ключевые скриншоты.
+Дедупликатор делит находки на точные дубли (пропускаются всегда), возможные дубли (пропускаются при
+`--approve-all-new`, но могут быть явно одобрены владельцем через `--approve <id>`) и новые кандидаты.
+Отправь владельцу в чат T3 сводку и ключевые скриншоты.
 
 ### 7. Owner-gate для GitHub Issues
 
