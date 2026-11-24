@@ -4,12 +4,20 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any, TextIO
 
 from .android import ALLOWED_HDD_ROOT, AndroidKvmAdapter, AndroidStandConfig
 from .core import AdapterRegistry, PlatformAdapter, StandError
+from .ui_driver import (
+    DEFAULT_MOBILE_MCP_PACKAGE,
+    build_mcp_server_config,
+    build_ui_driver_serve_spec,
+    call_ui_driver_tool,
+    check_ui_driver,
+)
 
 
 def build_default_registry() -> AdapterRegistry:
@@ -101,6 +109,31 @@ def _build_parser() -> argparse.ArgumentParser:
     p_snap = sub.add_parser("snapshot-save", help="Сохранить чистый базовый снапшот (Android)")
     p_snap.add_argument("name", nargs="?", default=None, help="Имя снапшота (по умолчанию clean-base)")
 
+    p_drv = sub.add_parser("ui-driver", help="Управление и проверка UI-драйвера (@mobilenext/mobile-mcp)")
+    drv_sub = p_drv.add_subparsers(dest="ui_driver_command", required=True)
+
+    p_drv_cfg = drv_sub.add_parser("mcp-config", help="Вывести MCP-конфигурацию для агента (JSON)")
+    p_drv_cfg.add_argument("--device", default=None, help="ADB serial устройства (по умолчанию 127.0.0.1:<local_adb_port>)")
+    p_drv_cfg.add_argument("--package", default=DEFAULT_MOBILE_MCP_PACKAGE, help="npm-пакет драйвера")
+
+    p_drv_doc = drv_sub.add_parser("doctor", help="Проверить готовность UI-драйвера и ADB-окружения")
+    p_drv_doc.add_argument("--device", default=None, help="ADB serial устройства (по умолчанию 127.0.0.1:<local_adb_port>)")
+    p_drv_doc.add_argument("--package", default=DEFAULT_MOBILE_MCP_PACKAGE, help="npm-пакет драйвера")
+    p_drv_doc.add_argument("--probe-mcp", action="store_true", help="Выполнить реальное MCP-рукопожатие и проверку устройств")
+    p_drv_doc.add_argument("--require-device", action="store_true", help="Считать ready=false, если устройство не online")
+
+    p_drv_srv = drv_sub.add_parser("serve", help="Запустить @mobilenext/mobile-mcp с гарантированным PATH/ANDROID_HOME")
+    p_drv_srv.add_argument("--device", default=None, help="ADB serial устройства (по умолчанию 127.0.0.1:<local_adb_port>)")
+    p_drv_srv.add_argument("--package", default=DEFAULT_MOBILE_MCP_PACKAGE, help="npm-пакет драйвера")
+    p_drv_srv.add_argument("--listen", default=None, help="Поднять Streamable HTTP сервер на [host:]port вместо stdio")
+
+    p_drv_call = drv_sub.add_parser("call", help="Выполнить один инструмент mobile_* через @mobilenext/mobile-mcp")
+    p_drv_call.add_argument("tool", help="Имя MCP-инструмента (например, mobile_list_elements_on_screen)")
+    p_drv_call.add_argument("--args-json", default="{}", help="JSON-объект аргументов инструмента")
+    p_drv_call.add_argument("--device", default=None, help="ADB serial устройства (по умолчанию 127.0.0.1:<local_adb_port>)")
+    p_drv_call.add_argument("--package", default=DEFAULT_MOBILE_MCP_PACKAGE, help="npm-пакет драйвера")
+    p_drv_call.add_argument("--timeout", type=float, default=30.0, help="Таймаут MCP-вызова (сек)")
+
     return parser
 
 
@@ -132,6 +165,9 @@ def run_cli(
     if args.command == "platforms":
         _emit({"platforms": reg.list_platforms()}, as_json=args.as_json, stream=out)
         return 0
+
+    if args.command == "ui-driver":
+        return _run_ui_driver_cli(args, out=out, err=err)
 
     try:
         adapter_kwargs: dict[str, Any] = {}
@@ -201,6 +237,76 @@ def run_cli(
             return 0
 
         raise StandError(f"Неизвестная команда: {args.command}")
+    except StandError as exc:
+        if args.as_json:
+            _emit({"ok": False, "error": str(exc)}, as_json=True, stream=out)
+        else:
+            err.write(f"Ошибка: {exc}\n")
+        return 1
+
+
+def _run_ui_driver_cli(args: argparse.Namespace, *, out: TextIO, err: TextIO) -> int:
+    device_id = args.device or f"127.0.0.1:{args.local_adb_port}"
+    try:
+        if args.ui_driver_command == "mcp-config":
+            cfg = build_mcp_server_config(
+                adb_bin=args.adb_bin,
+                device_id=device_id,
+                package=args.package,
+            )
+            out.write(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n")
+            return 0
+
+        if args.ui_driver_command == "doctor":
+            st = check_ui_driver(
+                adb_bin=args.adb_bin,
+                device_id=device_id,
+                package=args.package,
+                probe_mcp=args.probe_mcp,
+                require_device=args.require_device,
+            )
+            _emit(st.to_dict(), as_json=args.as_json, stream=out)
+            return 0 if st.ready else 1
+
+        if args.ui_driver_command == "serve":
+            cmd, env = build_ui_driver_serve_spec(
+                adb_bin=args.adb_bin,
+                device_id=device_id,
+                package=args.package,
+                listen=args.listen,
+            )
+            os.execvpe(cmd[0], cmd, env)
+            return 0
+
+        if args.ui_driver_command == "call":
+            try:
+                parsed_args = json.loads(args.args_json)
+            except json.JSONDecodeError as exc:
+                raise StandError(f"Некорректный JSON в --args-json: {exc}") from exc
+            if not isinstance(parsed_args, dict):
+                raise StandError("--args-json должен быть JSON-объектом")
+            res = call_ui_driver_tool(
+                args.tool,
+                parsed_args,
+                adb_bin=args.adb_bin,
+                device_id=device_id,
+                package=args.package,
+                timeout_s=args.timeout,
+            )
+            payload = {
+                "ok": True,
+                "tool": args.tool,
+                "device": device_id,
+                "text": res.text,
+                "image_count": len(res.images),
+            }
+            if args.as_json:
+                _emit(payload, as_json=True, stream=out)
+            else:
+                out.write((res.text or f"images={len(res.images)}") + "\n")
+            return 0
+
+        raise StandError(f"Неизвестная подкоманда ui-driver: {args.ui_driver_command}")
     except StandError as exc:
         if args.as_json:
             _emit({"ok": False, "error": str(exc)}, as_json=True, stream=out)
