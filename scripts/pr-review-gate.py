@@ -629,7 +629,7 @@ def cmd_act(args: argparse.Namespace) -> int:
                 and pr.get("mergeable") == "MERGEABLE"
                 and not has_other_changes_requested(pr)
             ):
-                run(["gh", "pr", "merge", str(args.pr), "--repo", args.repo, "--squash"])
+                run(["gh", "pr", "merge", str(args.pr), "--repo", args.repo, "--squash", "--delete-branch"])
                 print(json.dumps({"result": "merged", "sha": args.sha, "checks": checks}))
             else:
                 print(
@@ -682,7 +682,7 @@ def cmd_act(args: argparse.Namespace) -> int:
             and pr.get("mergeable") == "MERGEABLE"
             and not has_other_changes_requested(pr)
         ):
-            run(["gh", "pr", "merge", str(args.pr), "--repo", args.repo, "--squash"])
+            run(["gh", "pr", "merge", str(args.pr), "--repo", args.repo, "--squash", "--delete-branch"])
             print(json.dumps({"result": "merged", "sha": args.sha, "checks": checks}))
         else:
             print(
