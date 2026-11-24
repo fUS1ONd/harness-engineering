@@ -25,6 +25,7 @@
 - **Трекер задач и спеки (`.scratch/`):** [workflow/issue-tracker.md](workflow/issue-tracker.md)
 - **Макеты и экраны до кода (`html_render`):** [workflow/ui-preview.md](workflow/ui-preview.md)
 - **E2E-стенд проверки VPN-подписок (`ssh home`):** [workflow/vpn-e2e-stand.md](workflow/vpn-e2e-stand.md) (`scripts/vpn-e2e-stand.py`)
+- **Авто-ревью и мердж коллабораторских PR:** [docs/pr-review-gate.md](docs/pr-review-gate.md) (`scripts/pr-review-gate.py`)
 - **Инженерные принципы и ворота качества:** [standards/engineering.md](standards/engineering.md)
 
 ## Глобальные правила коммитов и контекста
