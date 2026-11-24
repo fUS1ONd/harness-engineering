@@ -329,6 +329,7 @@ class AndroidKvmAdapter(PlatformAdapter):
             f'mkdir -p "$ANDROID_HOME" "$ANDROID_USER_HOME" "$ANDROID_AVD_HOME" '
             f'"$TMPDIR" "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME" "$HOME" "$XDG_RUNTIME_DIR" '
             f"{shlex.quote(posixpath.join(self.config.remote_root, 'logs'))}\n"
+            'chmod 700 "$XDG_RUNTIME_DIR"\n'
         )
         return guard + body.lstrip("\n") + "\n}\n__app_verify_main </dev/null\n"
 
@@ -405,8 +406,10 @@ class AndroidKvmAdapter(PlatformAdapter):
             )
 
     def _close_tunnel(self) -> None:
-        self.runner.run(self.build_tunnel_control_command("exit"), timeout=10.0)
-        self.config.control_socket.unlink(missing_ok=True)
+        try:
+            self.runner.run(self.build_tunnel_control_command("exit"), timeout=10.0)
+        finally:
+            self.config.control_socket.unlink(missing_ok=True)
 
     def _connect_local_adb(self) -> None:
         deadline = self._monotonic() + self.config.adb_timeout_s
@@ -520,7 +523,14 @@ fi
 
 if is_running; then
   if [ "{reset_flag}" = "1" ] && [ "$HAS_SNAP" = "1" ]; then
-    if "$ADB" -s {serial_q} emu avd snapshot load {snap_q} >/dev/null 2>&1 && wait_boot; then
+    SNAP_LOAD_RC=0
+    SNAP_LOAD_OUT=$("$ADB" -s {serial_q} emu avd snapshot load {snap_q} 2>&1) || SNAP_LOAD_RC=$?
+    SNAP_LOAD_CLEAN="${{SNAP_LOAD_OUT//$'\r'/}}"
+    if grep -q "^KO:" <<< "$SNAP_LOAD_CLEAN"; then
+      printf 'SNAPSHOT_LOAD_FAILED: %s\n' "$SNAP_LOAD_OUT" >&2
+      exit 44
+    fi
+    if [ "$SNAP_LOAD_RC" -eq 0 ] && grep -qx "OK" <<< "$SNAP_LOAD_CLEAN" && wait_boot; then
       RESTORED="snapshot-load"
     else
       "$ADB" -s {serial_q} emu kill >/dev/null 2>&1 || true
@@ -591,8 +601,15 @@ fi
 
     def stop(self) -> StandStatus:
         """Отключает локальный ADB, закрывает SSH-туннель и останавливает эмулятор на `ssh home`."""
-        self._run_local_adb(["disconnect", self.config.local_serial], with_serial=False)
-        self._close_tunnel()
+        local_warnings: list[str] = []
+        try:
+            self._run_local_adb(["disconnect", self.config.local_serial], with_serial=False)
+        except StandError as exc:
+            local_warnings.append(f"adb disconnect: {exc}")
+        try:
+            self._close_tunnel()
+        except StandError as exc:
+            local_warnings.append(f"ssh tunnel exit: {exc}")
 
         serial_q = shlex.quote(self.config.remote_serial)
         body = f"""
@@ -618,13 +635,16 @@ echo "stopped=1"
         if res.returncode != 0:
             raise StandError(f"Ошибка остановки эмулятора на {self.config.ssh_host}: {res.stderr_text.strip()}")
 
+        details: dict[str, Any] = {"remote_root": self.config.remote_root}
+        if local_warnings:
+            details["local_cleanup_warnings"] = local_warnings
         return StandStatus(
             platform=self.platform,
             state="stopped",
             target_id=self.config.local_serial,
             endpoint=f"{self.config.ssh_host}:{self.config.remote_adb_port} -> {self.config.local_serial}",
             snapshot=None,
-            details={"remote_root": self.config.remote_root},
+            details=details,
         )
 
     def status(self) -> StandStatus:
@@ -849,7 +869,14 @@ echo "boot_completed=$BOOT_COMPLETED"
         body = f"""
 ADB="$ANDROID_HOME/platform-tools/adb"
 {anim_cmds}
-"$ADB" -s {serial_q} emu avd snapshot save {snap_q}
+SNAP_SAVE_RC=0
+SNAP_SAVE_OUT=$("$ADB" -s {serial_q} emu avd snapshot save {snap_q} 2>&1) || SNAP_SAVE_RC=$?
+SNAP_SAVE_CLEAN="${{SNAP_SAVE_OUT//$'\r'/}}"
+printf '%s\n' "$SNAP_SAVE_OUT"
+if [ "$SNAP_SAVE_RC" -ne 0 ] || grep -q "^KO:" <<< "$SNAP_SAVE_CLEAN" || ! grep -qx "OK" <<< "$SNAP_SAVE_CLEAN"; then
+  printf 'SNAPSHOT_SAVE_FAILED: %s\n' "$SNAP_SAVE_OUT" >&2
+  exit 45
+fi
 """
         res = self._run_remote(body, timeout=60.0)
         if res.returncode == 42:
@@ -857,6 +884,11 @@ ADB="$ANDROID_HOME/platform-tools/adb"
         if res.returncode != 0:
             raise StandError(
                 f"Не удалось сохранить снапшот {snap}: {res.stderr_text.strip() or res.stdout_text.strip()}"
+            )
+        if not _is_adb_emu_ok(res.stdout_text):
+            raise StandError(
+                f"Эмулятор отклонил сохранение снапшота {snap}: "
+                f"{res.stdout_text.strip() or res.stderr_text.strip() or 'отсутствует OK в ответе adb emu'}"
             )
         return StandStatus(
             platform=self.platform,
@@ -866,6 +898,14 @@ ADB="$ANDROID_HOME/platform-tools/adb"
             snapshot=snap,
             details={"output": res.stdout_text.strip()},
         )
+
+
+def _is_adb_emu_ok(output: str) -> bool:
+    """Проверяет stdout `adb emu`: должна присутствовать строка `OK` и отсутствовать `KO:`."""
+    lines = [line.strip() for line in output.replace("\r", "").splitlines() if line.strip()]
+    has_ok = any(line == "OK" for line in lines)
+    has_ko = any(line.startswith("KO:") for line in lines)
+    return has_ok and not has_ko
 
 
 def _parse_kv_lines(text: str) -> dict[str, Any]:

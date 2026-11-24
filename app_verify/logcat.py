@@ -22,11 +22,20 @@ def _matches_package(lines: list[str], package: str | None) -> bool:
     return package in blob
 
 
+def _is_anomaly_start(line: str) -> bool:
+    return bool(
+        _JAVA_CRASH_START.search(line)
+        or _NATIVE_SIGNAL.search(line)
+        or _ANR_START.search(line)
+    )
+
+
 def analyze_logcat(
     raw_text: str,
     *,
     package: str | None = None,
     max_block_lines: int = 40,
+    max_interleaved_gap: int = 30,
 ) -> tuple[list[LogAnomaly], list[LogAnomaly]]:
     """Извлекает блоки Java/Native crash и ANR из вывода `adb logcat -d -v threadtime`."""
     lines = raw_text.splitlines()
@@ -51,34 +60,39 @@ def analyze_logcat(
                 crashes.append(LogAnomaly(kind="crash", summary=summary, lines=block))
             continue
 
-        if _NATIVE_SIGNAL.search(line):
+        if _NATIVE_SIGNAL.search(line) or _TOMBSTONE_BANNER.search(line):
+            is_signal = bool(_NATIVE_SIGNAL.search(line))
+            seen_banner = bool(_TOMBSTONE_BANNER.search(line))
             block = [line]
-            i += 1
-            while i < total and len(block) < max_block_lines:
-                nxt = lines[i]
-                if _TOMBSTONE_BANNER.search(nxt) or _TOMBSTONE_LINE.search(nxt):
+            last_consumed = i
+            j = i + 1
+            non_debug_gap = 0
+            while j < total and len(block) < max_block_lines and non_debug_gap < max_interleaved_gap:
+                nxt = lines[j]
+                if _is_anomaly_start(nxt):
+                    break
+                if _TOMBSTONE_BANNER.search(nxt):
+                    if seen_banner:
+                        break
+                    seen_banner = True
                     block.append(nxt)
-                    i += 1
+                    last_consumed = j
+                    non_debug_gap = 0
+                elif _TOMBSTONE_LINE.search(nxt):
+                    block.append(nxt)
+                    last_consumed = j
+                    non_debug_gap = 0
                 else:
-                    break
+                    non_debug_gap += 1
+                j += 1
+            i = last_consumed + 1
             if _matches_package(block, package):
-                m = _NATIVE_SIGNAL.search(line)
-                summary = line[m.start() :].strip() if m else line.strip()
+                if is_signal:
+                    m = _NATIVE_SIGNAL.search(line)
+                    summary = line[m.start() :].strip() if m else line.strip()
+                else:
+                    summary = "Native crash (DEBUG tombstone)"
                 crashes.append(LogAnomaly(kind="crash", summary=summary, lines=block))
-            continue
-
-        if _TOMBSTONE_BANNER.search(line):
-            block = [line]
-            i += 1
-            while i < total and len(block) < max_block_lines and _TOMBSTONE_LINE.search(lines[i]):
-                if _TOMBSTONE_BANNER.search(lines[i]):
-                    break
-                block.append(lines[i])
-                i += 1
-            if _matches_package(block, package):
-                crashes.append(
-                    LogAnomaly(kind="crash", summary="Native crash (DEBUG tombstone)", lines=block)
-                )
             continue
 
         if _ANR_START.search(line):

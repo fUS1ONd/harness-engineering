@@ -244,6 +244,31 @@ class LogcatAnalyzerTests(unittest.TestCase):
         self.assertEqual(crashes, [])
         self.assertEqual(anrs, [])
 
+    def test_interleaved_noise_does_not_truncate_native_tombstone_or_swallow_anr(self) -> None:
+        sample = (
+            "11-24 19:01:09.000  3001  3005 F libc    : Fatal signal 11 (SIGSEGV), code 1 (SEGV_MAPERR) in tid 3005 (Thread-4), pid 3001 (ap.android.debug)\n"
+            "11-24 19:01:09.001  1000  1050 I chatty  : uid=1000(system) identical 2 lines\n"
+            "11-24 19:01:09.002   500   520 W ActivityManager: Force finishing activity ru.rumap.android.debug/.MainActivity\n"
+            "11-24 19:01:09.010  3010  3010 F DEBUG   : *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** ***\n"
+            "11-24 19:01:09.011  3010  3010 F DEBUG   : Build fingerprint: 'google/sdk/generic:14'\n"
+            "11-24 19:01:09.012  1000  1050 I chatty  : uid=1000(system) identical 1 line\n"
+            "11-24 19:01:09.013  3010  3010 F DEBUG   : pid: 3001, tid: 3005, name: Thread-4  >>> ru.rumap.android.debug <<<\n"
+            "11-24 19:01:09.014  3010  3010 F DEBUG   : backtrace:\n"
+            "11-24 19:01:09.020   500   520 E ActivityManager: ANR in ru.rumap.android.debug\n"
+            "11-24 19:01:09.021   500   520 E ActivityManager: Reason: Broadcast timeout\n"
+            "11-24 19:01:10.000  4010  4010 F DEBUG   : *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** ***\n"
+            "11-24 19:01:10.001  1000  1050 I chatty  : uid=1000(system) identical 3 lines\n"
+            "11-24 19:01:10.002  4010  4010 F DEBUG   : pid: 4001, tid: 4001, name: main  >>> ru.rumap.android.debug <<<\n"
+        )
+        crashes, anrs = analyze_logcat(sample, package="ru.rumap.android.debug")
+        self.assertEqual(len(crashes), 2)
+        self.assertEqual(len(anrs), 1)
+        self.assertIn("Fatal signal 11", crashes[0].summary)
+        self.assertTrue(any(">>> ru.rumap.android.debug <<<" in ln for ln in crashes[0].lines))
+        self.assertEqual(crashes[1].summary, "Native crash (DEBUG tombstone)")
+        self.assertTrue(any("pid: 4001" in ln for ln in crashes[1].lines))
+        self.assertIn("ANR in ru.rumap.android.debug", anrs[0].summary)
+
 
 class _FakeRunner:
     def __init__(self, handlers) -> None:
@@ -420,7 +445,9 @@ class AndroidKvmAdapterTests(unittest.TestCase):
             script = adapter.build_remote_script("echo ok")
             mount_pos = script.index('df --output=target "$CHECK_PATH"')
             mkdir_pos = script.index('mkdir -p "$ANDROID_HOME"')
+            chmod_pos = script.index('chmod 700 "$XDG_RUNTIME_DIR"')
             self.assertLess(mount_pos, mkdir_pos)
+            self.assertLess(mkdir_pos, chmod_pos)
             self.assertIn("printf 'HDD_INVARIANT_VIOLATION: %s resides on root SSD /\\n'", script)
             self.assertIn("--", adapter.build_ssh_command())
             self.assertIn("--", adapter.build_tunnel_start_command())
@@ -509,6 +536,79 @@ class AndroidKvmAdapterTests(unittest.TestCase):
             adapter = AndroidKvmAdapter(cfg, runner=_FakeRunner(handler))
             with self.assertRaises(StandError):
                 adapter.start(snapshot="missing-snap", reset=True)
+
+    def test_stop_reaches_remote_qemu_kill_when_local_adb_and_tunnel_fail(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._make_config(td)
+            cfg.ssh_control_dir.mkdir(parents=True, exist_ok=True)
+            cfg.control_socket.write_text("stale", encoding="utf-8")
+            remote_called = False
+
+            def handler(args: list[str], _inp: bytes | None, _timeout: float | None) -> CommandResult:
+                nonlocal remote_called
+                if args[0] == cfg.adb_bin and args[1] == "disconnect":
+                    raise StandTimeoutError("local adb hung")
+                if args[0] == "ssh" and "-O" in args and "exit" in args:
+                    raise StandError("broken control socket")
+                if args[0] == "ssh" and "bash" in args:
+                    remote_called = True
+                    return CommandResult(0, b"stopped=1\n")
+                raise AssertionError(f"Unexpected call: {args}")
+
+            adapter = AndroidKvmAdapter(cfg, runner=_FakeRunner(handler))
+            stopped = adapter.stop()
+            self.assertTrue(remote_called)
+            self.assertEqual(stopped.state, "stopped")
+            self.assertFalse(cfg.control_socket.exists())
+            self.assertEqual(len(stopped.details.get("local_cleanup_warnings", [])), 2)
+
+            def fail_remote_handler(args: list[str], _inp: bytes | None, _timeout: float | None) -> CommandResult:
+                if args[0] == cfg.adb_bin and args[1] == "disconnect":
+                    raise StandError("adb missing")
+                if args[0] == "ssh" and "-O" in args:
+                    raise StandError("tunnel error")
+                if args[0] == "ssh" and "bash" in args:
+                    return CommandResult(1, stderr=b"ssh failed\n")
+                raise AssertionError(f"Unexpected call: {args}")
+
+            with self.assertRaises(StandError):
+                AndroidKvmAdapter(cfg, runner=_FakeRunner(fail_remote_handler)).stop()
+
+    def test_snapshot_load_and_save_validate_adb_emu_ok_and_reject_ko(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._make_config(td)
+            seen_scripts: list[str] = []
+
+            def start_ko_handler(args: list[str], inp: bytes | None, _timeout: float | None) -> CommandResult:
+                if args[0] == cfg.adb_bin and args[1] == "disconnect":
+                    return CommandResult(0)
+                if args[0] == "ssh" and "bash" in args:
+                    script = (inp or b"").decode("utf-8")
+                    seen_scripts.append(script)
+                    self.assertNotIn("emu avd snapshot load 'clean-base' >/dev/null", script)
+                    self.assertIn('grep -q "^KO:"', script)
+                    self.assertIn('grep -qx "OK"', script)
+                    self.assertIn("SNAPSHOT_LOAD_FAILED", script)
+                    return CommandResult(44, stderr=b"SNAPSHOT_LOAD_FAILED: KO: snapshot corrupt\n")
+                raise AssertionError(f"Unexpected call: {args}")
+
+            with self.assertRaises(StandError) as ctx:
+                AndroidKvmAdapter(cfg, runner=_FakeRunner(start_ko_handler)).start(snapshot="clean-base", reset=True)
+            self.assertIn("KO: snapshot corrupt", str(ctx.exception))
+            self.assertEqual(len(seen_scripts), 1)
+
+            for bad_stdout in (b"KO: failed to save\n", b"KO: bad\nOK\n", b""):
+                with self.subTest(stdout=bad_stdout):
+                    def save_handler(
+                        args: list[str], inp: bytes | None, _timeout: float | None, out: bytes = bad_stdout
+                    ) -> CommandResult:
+                        script = (inp or b"").decode("utf-8")
+                        self.assertIn('grep -q "^KO:"', script)
+                        self.assertIn('grep -qx "OK"', script)
+                        return CommandResult(0, out)
+
+                    with self.assertRaises(StandError):
+                        AndroidKvmAdapter(cfg, runner=_FakeRunner(save_handler)).save_snapshot("clean-base")
 
 
 class CliTests(unittest.TestCase):

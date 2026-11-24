@@ -9,7 +9,8 @@ from __future__ import annotations
 import json
 import re
 import shlex
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
+from pathlib import Path
 from typing import Any
 
 from .android import CommandResult, CommandRunner, SubprocessRunner, find_local_adb
@@ -81,6 +82,7 @@ class DebugHookResult:
     diagnostics: dict[str, Any] | None = None
     broadcast_result: int = 0
     raw_stdout: str = ""
+    local_output_file: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -258,5 +260,30 @@ class DebugHooksClient:
     def reset_state(self) -> DebugHookResult:
         return self.run_command(COMMAND_RESET_STATE)
 
-    def dump_diagnostics(self, output_path: str | None = None) -> DebugHookResult:
-        return self.run_command(COMMAND_DUMP_DIAGNOSTICS, output_path=output_path)
+    def dump_diagnostics(
+        self,
+        output_path: str | None = None,
+        *,
+        device_output_path: str | None = None,
+        local_output: str | Path | None = None,
+    ) -> DebugHookResult:
+        effective_device_path = device_output_path if device_output_path is not None else output_path
+        res = self.run_command(COMMAND_DUMP_DIAGNOSTICS, output_path=effective_device_path)
+        if local_output is not None:
+            if res.diagnostics is None:
+                raise StandError(
+                    "Ответ `dump_diagnostics` не содержит поля `diagnostics` для локального сохранения"
+                )
+            target_path = Path(local_output)
+            try:
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+                target_path.write_text(
+                    json.dumps(res.diagnostics, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+            except OSError as exc:
+                raise StandError(
+                    f"Не удалось сохранить диагностику в {target_path}: {exc}"
+                ) from exc
+            return replace(res, local_output_file=str(target_path))
+        return res

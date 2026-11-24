@@ -20,6 +20,17 @@ class UnknownPlatformError(StandError):
     """Запрошен незарегистрированный платформенный адаптер."""
 
 
+def is_existing_file(text: str) -> bool:
+    """Проверяет, указывает ли строка на существующий файл, избегая OSError на длинном JSON."""
+    stripped = text.lstrip()
+    if stripped.startswith("{") or stripped.startswith("["):
+        return False
+    try:
+        return Path(text).is_file()
+    except OSError:
+        return False
+
+
 @dataclass(frozen=True)
 class StandStatus:
     platform: str

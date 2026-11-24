@@ -25,12 +25,12 @@
   - `python3 scripts/app-verify.py ui-driver mcp-config` — сгенерировать JSON-фрагмент `mcpServers` для подключения MCP-клиента агента.
   - `python3 scripts/app-verify.py --json ui-driver doctor [--probe-mcp] [--require-device]` — проверить локальный `adb`, `ANDROID_HOME`, Node/`npx` и (с `--probe-mcp`) выполнить реальное MCP-рукопожатие и опрос устройств; при устаревшем фоновом демоне `mobilecli` автоматически перезапускает его, если `adb devices` уже видит устройство `online`.
   - `python3 scripts/app-verify.py ui-driver serve [--listen <host:port>]` — запустить `@mobilenext/mobile-mcp` в режиме `--stdio` (по умолчанию) или Streamable HTTP с гарантированным окружением.
-  - `python3 scripts/app-verify.py --json ui-driver call <tool> [--args-json '<json>']` — выполнить одиночный вызов MCP-инструмента (автоматически подставляет `device=127.0.0.1:15565`, если он не указан явно).
+  - `python3 scripts/app-verify.py --json ui-driver call <tool> [--args-json '<json>'] [--save-image <path>]` — выполнить одиночный вызов MCP-инструмента (автоматически подставляет `device=127.0.0.1:15565`, если он не указан явно; `--save-image` сохраняет PNG из ответа `mobile_take_screenshot`).
 - **White-box debug-хуки (`ru.rumap.android.debug`):** вызов `am broadcast` к `DebugVerificationReceiver` debug-сборки (в `release` физически отсутствует):
   - `python3 scripts/app-verify.py --json debug navigate --target <target>` — перейти на экран/диалог (`home`, `main`, `check`, `settings`, `region`, `anchors`, `diaglog`, `benchmark`, `calibration`, `calibration_advanced`, `update`, `advanced`, `help`, `battery_onboarding`, `region_onboarding`, `mandatory_update`).
   - `python3 scripts/app-verify.py --json debug mock-state --preset <preset> [--error-message <msg>]` — мок состояния (`clear`, `none`, `offline`, `degraded_cellular`, `vpn_active`, `center_sync_error`).
   - `python3 scripts/app-verify.py --json debug reset-state` — сбросить локальную БД, настройки и debug-overlay.
-  - `python3 scripts/app-verify.py --json debug dump-diagnostics [--output-path <path>]` — read-only дамп диагностики приложения.
+  - `python3 scripts/app-verify.py --json debug dump-diagnostics [--output <local.json>] [--device-output-path <path>]` — read-only дамп диагностики приложения (локальное сохранение на VPS через `--output`; запись в `cacheDir` на устройстве через `--device-output-path`, алиас `--output-path`).
   - Все подкоманды принимают `--device <serial>` и `--package <pkg>` (по умолчанию `ru.rumap.android.debug`).
 - **Отчёт и GitHub Issues:** `report` рендерит Markdown/сводку из `run.json`, `issues dedup` сверяет находки с открытыми issue, `issues create` заводит issue только после `--confirm-owner-approval` (см. ниже).
 
@@ -112,7 +112,9 @@ python3 scripts/app-verify.py --json issues create --input .scratch/app-verify-<
 ```
 
 Правила вердикта: `BLOCKED` при крашах/ANR/находках `Blocker`, `CONDITIONAL` при `Major`
-или любой оси рубрики `<= 3`, иначе `READY`. Дедупликатор делит находки на точные дубли
-(пропускаются), возможные дубли (не создаются по умолчанию) и новые кандидаты. Без
-`--confirm-owner-approval` команда `issues create` завершается ошибкой и не вызывает
-`gh issue create`; `--dry-run` только показывает план.
+или любой оси рубрики `<= 3`, иначе `READY`. Дедупликатор делит находки на точные дубли,
+возможные дубли (оба класса пропускаются при `--approve-all-new`, но могут быть явно
+переопределены владельцем через `--approve <id>`) и новые кандидаты. Новым багам по умолчанию
+добавляется метка `status:needs-triage` без `assignee`. Без `--confirm-owner-approval` команда
+`issues create` завершается ошибкой и не вызывает `gh issue create`; `--dry-run` только
+показывает план.

@@ -13,6 +13,8 @@ from .android import ALLOWED_HDD_ROOT, AndroidKvmAdapter, AndroidStandConfig
 from .core import AdapterRegistry, PlatformAdapter, StandError
 from .debug_hooks import DEFAULT_DEBUG_PACKAGE, DebugHooksClient
 from .issues import (
+    IssueCreationError,
+    OpenIssue,
     OwnerApprovalRequiredError,
     create_approved_issues,
     deduplicate_findings,
@@ -26,6 +28,7 @@ from .ui_driver import (
     build_ui_driver_serve_spec,
     call_ui_driver_tool,
     check_ui_driver,
+    save_mcp_images,
 )
 
 
@@ -142,6 +145,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p_drv_call.add_argument("--device", default=None, help="ADB serial устройства (по умолчанию 127.0.0.1:<local_adb_port>)")
     p_drv_call.add_argument("--package", default=DEFAULT_MOBILE_MCP_PACKAGE, help="npm-пакет драйвера")
     p_drv_call.add_argument("--timeout", type=float, default=30.0, help="Таймаут MCP-вызова (сек)")
+    p_drv_call.add_argument(
+        "--save-image",
+        default=None,
+        help="Сохранить возвращённое изображение (например, от mobile_take_screenshot) в локальный файл",
+    )
 
     p_debug = sub.add_parser(
         "debug",
@@ -163,7 +171,18 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_debug_common_args(p_dbg_reset)
 
     p_dbg_dump = debug_sub.add_parser("dump-diagnostics", help="Снять read-only дамп диагностики приложения")
-    p_dbg_dump.add_argument("--output-path", default=None, help="Путь внутри cacheDir приложения для сохранения JSON")
+    p_dbg_dump.add_argument(
+        "--output",
+        default=None,
+        help="Локальный путь на VPS для сохранения JSON диагностики из ответа приёмника",
+    )
+    p_dbg_dump.add_argument(
+        "--device-output-path",
+        "--output-path",
+        dest="device_output_path",
+        default=None,
+        help="Путь внутри cacheDir приложения на устройстве для сохранения JSON (алиас: --output-path)",
+    )
     _add_debug_common_args(p_dbg_dump)
 
     p_report = sub.add_parser("report", help="Сгенерировать Markdown/JSON отчёт верификации из run.json")
@@ -412,17 +431,27 @@ def _run_ui_driver_cli(args: argparse.Namespace, *, out: TextIO, err: TextIO) ->
                 package=args.package,
                 timeout_s=args.timeout,
             )
-            payload = {
+            saved_images: list[str] = []
+            if args.save_image:
+                saved_images = save_mcp_images(res.images, Path(args.save_image))
+            payload: dict[str, Any] = {
                 "ok": True,
                 "tool": args.tool,
                 "device": device_id,
                 "text": res.text,
                 "image_count": len(res.images),
             }
+            if saved_images:
+                payload["saved_images"] = saved_images
             if args.as_json:
                 _emit(payload, as_json=True, stream=out)
             else:
-                out.write((res.text or f"images={len(res.images)}") + "\n")
+                if res.text:
+                    out.write(res.text + "\n")
+                elif saved_images:
+                    out.write("\n".join(saved_images) + "\n")
+                else:
+                    out.write(f"images={len(res.images)}\n")
             return 0
 
         raise StandError(f"Неизвестная подкоманда ui-driver: {args.ui_driver_command}")
@@ -457,7 +486,10 @@ def _run_debug_cli(args: argparse.Namespace, *, out: TextIO, err: TextIO) -> int
         elif args.debug_command == "reset-state":
             res = client.reset_state()
         elif args.debug_command == "dump-diagnostics":
-            res = client.dump_diagnostics(args.output_path)
+            res = client.dump_diagnostics(
+                device_output_path=args.device_output_path,
+                local_output=args.output,
+            )
         else:
             raise StandError(f"Неизвестная подкоманда debug: {args.debug_command}")
 
@@ -473,10 +505,10 @@ def _run_debug_cli(args: argparse.Namespace, *, out: TextIO, err: TextIO) -> int
 
 def _run_report_cli(args: argparse.Namespace, *, out: TextIO, err: TextIO) -> int:
     try:
-        report = load_verification_report(args.input)
+        report = load_verification_report(Path(args.input))
         plan = None
         if args.open_issues:
-            plan = deduplicate_findings(report.findings, load_open_issues(args.open_issues))
+            plan = deduplicate_findings(report.findings, load_open_issues(Path(args.open_issues)))
 
         markdown = render_markdown_report(report, dedup_plan=plan)
         summary = render_chat_summary(report, dedup_plan=plan)
@@ -517,7 +549,7 @@ def _run_report_cli(args: argparse.Namespace, *, out: TextIO, err: TextIO) -> in
 
 def _resolve_cli_open_issues(args: argparse.Namespace, *, allow_fetch: bool) -> list[OpenIssue]:
     if args.open_issues:
-        return load_open_issues(args.open_issues)
+        return load_open_issues(Path(args.open_issues))
     if allow_fetch and getattr(args, "fetch_open", False):
         return fetch_open_issues(args.repo)
     if allow_fetch and getattr(args, "repo", None):
@@ -527,7 +559,7 @@ def _resolve_cli_open_issues(args: argparse.Namespace, *, allow_fetch: bool) -> 
 
 def _run_issues_cli(args: argparse.Namespace, *, out: TextIO, err: TextIO) -> int:
     try:
-        report = load_verification_report(args.input)
+        report = load_verification_report(Path(args.input))
 
         if args.issues_command == "dedup":
             issues = _resolve_cli_open_issues(args, allow_fetch=True)
@@ -572,6 +604,19 @@ def _run_issues_cli(args: argparse.Namespace, *, out: TextIO, err: TextIO) -> in
             return 0
 
         raise StandError(f"Неизвестная подкоманда issues: {args.issues_command}")
+    except IssueCreationError as exc:
+        if args.as_json:
+            payload = exc.result.to_dict()
+            payload["ok"] = False
+            payload["error"] = str(exc)
+            _emit(payload, as_json=True, stream=out)
+        else:
+            if exc.result.created:
+                out.write("Частично созданы GitHub Issues до ошибки:\n")
+                for created in exc.result.created:
+                    out.write(f"- {created.finding_id}: {created.url or created.title}\n")
+            err.write(f"Ошибка: {exc}\n")
+        return 1
     except (StandError, ValueError, OSError, json.JSONDecodeError) as exc:
         if args.as_json:
             _emit({"ok": False, "error": str(exc)}, as_json=True, stream=out)

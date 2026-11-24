@@ -311,6 +311,41 @@ class DebugHooksClientTests(unittest.TestCase):
         self.assertIn("output_path", remote)
         self.assertIn("/cache/diag.json", remote)
 
+    def test_dump_diagnostics_saves_local_json_and_errors_without_diagnostics(self) -> None:
+        diagnostics = {"screen": {"active_screen": "home"}, "mock_preset": "offline"}
+        runner = _FakeRunner(
+            CommandResult(
+                returncode=0,
+                stdout=_broadcast_stdout(
+                    {
+                        "ok": True,
+                        "command": "dump_diagnostics",
+                        "output_file": "/cache/device-diag.json",
+                        "diagnostics": diagnostics,
+                    }
+                ).encode(),
+            )
+        )
+        with tempfile.TemporaryDirectory() as td:
+            local_file = Path(td) / "sub" / "diag.json"
+            client = DebugHooksClient(adb_bin="adb", runner=runner)
+            res = client.dump_diagnostics(device_output_path="device-diag.json", local_output=local_file)
+            self.assertEqual(res.local_output_file, str(local_file))
+            self.assertEqual(json.loads(local_file.read_text(encoding="utf-8")), diagnostics)
+            remote = shlex.split(runner.calls[0][-1])
+            self.assertIn("output_path", remote)
+            self.assertIn("device-diag.json", remote)
+
+            no_diag_runner = _FakeRunner(
+                CommandResult(
+                    returncode=0,
+                    stdout=_broadcast_stdout({"ok": True, "command": "dump_diagnostics"}).encode(),
+                )
+            )
+            client2 = DebugHooksClient(adb_bin="adb", runner=no_diag_runner)
+            with self.assertRaises(StandError):
+                client2.dump_diagnostics(local_output=Path(td) / "missing.json")
+
     def test_missing_json_payload_on_result_zero_raises_stand_error(self) -> None:
         runner = _FakeRunner(
             CommandResult(returncode=0, stdout=b"Broadcast completed: result=0\n")
@@ -389,6 +424,69 @@ class DebugCliTests(unittest.TestCase):
         payload = json.loads(out.getvalue())
         self.assertFalse(payload["ok"])
         self.assertIn("android", payload["error"])
+
+    def test_cli_debug_dump_diagnostics_saves_local_output_and_accepts_device_aliases(self) -> None:
+        diagnostics = {"screen": {"active_screen": "settings"}, "db": {"rows": 3}}
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            args_log = root / "adb_args.txt"
+            line = _broadcast_stdout(
+                {
+                    "ok": True,
+                    "command": "dump_diagnostics",
+                    "output_file": "/cache/dev.json",
+                    "diagnostics": diagnostics,
+                }
+            ).replace("'", "'\\''")
+            adb = root / "adb"
+            adb.write_text(
+                f"#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{args_log}'\nprintf '%s' '{line}'\n",
+                encoding="utf-8",
+            )
+            adb.chmod(0o755)
+
+            local_out = root / "out" / "diag.json"
+            out = io.StringIO()
+            err = io.StringIO()
+            rc = run_cli(
+                [
+                    "--adb-bin",
+                    str(adb),
+                    "--json",
+                    "debug",
+                    "dump-diagnostics",
+                    "--output",
+                    str(local_out),
+                    "--device-output-path",
+                    "dev.json",
+                ],
+                stdout=out,
+                stderr=err,
+            )
+            self.assertEqual(rc, 0, err.getvalue())
+            payload = json.loads(out.getvalue())
+            self.assertEqual(payload["local_output_file"], str(local_out))
+            self.assertEqual(json.loads(local_out.read_text(encoding="utf-8")), diagnostics)
+
+            # Backward-compatible --output-path alias still forwards output_path extra to device
+            out2 = io.StringIO()
+            rc2 = run_cli(
+                [
+                    "--adb-bin",
+                    str(adb),
+                    "--json",
+                    "debug",
+                    "dump-diagnostics",
+                    "--output-path",
+                    "legacy.json",
+                ],
+                stdout=out2,
+                stderr=io.StringIO(),
+            )
+            self.assertEqual(rc2, 0)
+            recorded = args_log.read_text(encoding="utf-8")
+            self.assertIn("dev.json", recorded)
+            self.assertIn("legacy.json", recorded)
 
 
 if __name__ == "__main__":

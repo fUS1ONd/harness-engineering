@@ -7,6 +7,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence
 
+from .core import is_existing_file
+
 
 class _DedupMatchLike(Protocol):
     @property
@@ -166,6 +168,16 @@ class VerificationReport:
 
     def __post_init__(self) -> None:
         self.app = _validate_text(self.app, "VerificationReport.app")
+        seen_ids: set[str] = set()
+        duplicate_ids: list[str] = []
+        for finding in self.findings:
+            if finding.id in seen_ids and finding.id not in duplicate_ids:
+                duplicate_ids.append(finding.id)
+            seen_ids.add(finding.id)
+        if duplicate_ids:
+            raise ValueError(
+                "Обнаружены дублирующиеся Finding.id: " + ", ".join(duplicate_ids)
+            )
         if self.rubric is None:
             self.rubric = RubricScores(
                 functional=RubricAxis(3, "Рубрика не заполнена"),
@@ -277,15 +289,19 @@ def _finding_from_payload(item: Any, index: int) -> Finding:
 def report_from_dict(data: Mapping[str, Any]) -> VerificationReport:
     if not isinstance(data, Mapping):
         raise ValueError("Корневой объект отчёта должен быть JSON-объектом")
-    rubric_raw = data.get("rubric") or {}
-    if not isinstance(rubric_raw, Mapping):
-        raise ValueError("Поле 'rubric' должно быть объектом")
-    rubric = RubricScores(
-        functional=_rubric_axis_from_payload(rubric_raw.get("functional", 0)),
-        ui=_rubric_axis_from_payload(rubric_raw.get("ui", 0)),
-        ux=_rubric_axis_from_payload(rubric_raw.get("ux", 0)),
-        stability=_rubric_axis_from_payload(rubric_raw.get("stability", 0)),
-    )
+    rubric_raw = data.get("rubric")
+    rubric: RubricScores | None
+    if rubric_raw is None:
+        rubric = None
+    else:
+        if not isinstance(rubric_raw, Mapping):
+            raise ValueError("Поле 'rubric' должно быть объектом")
+        rubric = RubricScores(
+            functional=_rubric_axis_from_payload(rubric_raw.get("functional", 0)),
+            ui=_rubric_axis_from_payload(rubric_raw.get("ui", 0)),
+            ux=_rubric_axis_from_payload(rubric_raw.get("ux", 0)),
+            stability=_rubric_axis_from_payload(rubric_raw.get("stability", 0)),
+        )
     invariants_raw = data.get("invariants") or {}
     if not isinstance(invariants_raw, Mapping):
         raise ValueError("Поле 'invariants' должно быть объектом")
@@ -315,16 +331,6 @@ def report_from_dict(data: Mapping[str, Any]) -> VerificationReport:
     )
 
 
-def _is_existing_file(text: str) -> bool:
-    stripped = text.lstrip()
-    if stripped.startswith("{") or stripped.startswith("["):
-        return False
-    try:
-        return Path(text).exists()
-    except OSError:
-        return False
-
-
 def load_verification_report(source: Mapping[str, Any] | str | Path) -> VerificationReport:
     """Загружает отчёт из словаря, JSON-файла или JSON-строки."""
     if isinstance(source, Mapping):
@@ -332,7 +338,7 @@ def load_verification_report(source: Mapping[str, Any] | str | Path) -> Verifica
     if isinstance(source, Path):
         return report_from_dict(json.loads(source.read_text(encoding="utf-8")))
     text = str(source)
-    if _is_existing_file(text):
+    if is_existing_file(text):
         return report_from_dict(json.loads(Path(text).read_text(encoding="utf-8")))
     return report_from_dict(json.loads(text))
 

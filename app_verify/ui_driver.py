@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import os
 import selectors
@@ -47,7 +49,7 @@ class UiDriverStatus:
 
 def derive_android_sdk_root(adb_path: str | Path) -> str | None:
     """Выводит корень Android SDK из пути вида `<sdk>/platform-tools/adb`."""
-    resolved = Path(adb_path)
+    resolved = Path(adb_path).resolve()
     parent = resolved.parent
     if parent.name == "platform-tools":
         return str(parent.parent)
@@ -68,9 +70,8 @@ def build_ui_driver_env(
     adb_dir = str(adb_path.parent)
 
     current_path = environ.get("PATH", "")
-    path_parts = [p for p in current_path.split(":") if p]
-    if adb_dir not in path_parts:
-        environ["PATH"] = f"{adb_dir}:{current_path}" if current_path else adb_dir
+    path_parts = [p for p in current_path.split(":") if p and p != adb_dir]
+    environ["PATH"] = ":".join([adb_dir, *path_parts])
 
     sdk_root = derive_android_sdk_root(adb_path)
     if sdk_root:
@@ -441,6 +442,30 @@ class MobileMcpClient:
         if res.get("isError"):
             raise StandError(joined_text or f"Инструмент {name} вернул ошибку")
         return McpToolResult(content=content, text=joined_text, images=images)
+
+
+def save_mcp_images(images: list[dict[str, Any]], output_path: Path) -> list[str]:
+    """Декодирует base64-изображения из MCP-ответа и сохраняет их на диск."""
+    if not images:
+        raise StandError("Инструмент не вернул изображений для сохранения (--save-image)")
+    base = Path(output_path)
+    saved: list[str] = []
+    for idx, block in enumerate(images, start=1):
+        data_b64 = block.get("data")
+        if not isinstance(data_b64, str) or not data_b64.strip():
+            raise StandError(f"Блок изображения #{idx} не содержит base64-данных")
+        try:
+            raw = base64.b64decode(data_b64, validate=True)
+        except (ValueError, binascii.Error) as exc:
+            raise StandError(f"Некорректные base64-данные в изображении #{idx}: {exc}") from exc
+        target = base if idx == 1 else base.with_name(f"{base.stem}-{idx}{base.suffix}")
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(raw)
+        except OSError as exc:
+            raise StandError(f"Не удалось сохранить изображение в {target}: {exc}") from exc
+        saved.append(str(target))
+    return saved
 
 
 def _extract_online_devices(dev_res: McpToolResult, device_id: str) -> tuple[list[dict[str, Any]], bool]:

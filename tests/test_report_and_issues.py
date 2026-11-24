@@ -16,15 +16,19 @@ from app_verify.android import CommandResult
 from app_verify.cli import run_cli
 from app_verify.core import StandError
 from app_verify.issues import (
+    DEFAULT_ISSUE_LABELS,
     CreatedIssue,
     DedupPlan,
+    IssueCreationError,
     OpenIssue,
     OwnerApprovalRequiredError,
+    _identifier_tokens,
     create_approved_issues,
     deduplicate_findings,
     fetch_open_issues,
     format_issue_body,
     load_open_issues,
+    score_against_issue,
 )
 from app_verify.report import (
     SEVERITIES,
@@ -214,6 +218,20 @@ class ReportModelTests(unittest.TestCase):
         self.assertEqual(from_file.findings[0].id, "B1")
         self.assertEqual(from_file.verdict, "BLOCKED")
 
+    def test_report_from_dict_allows_missing_rubric_and_rejects_duplicate_finding_ids(self) -> None:
+        payload = _ready_report().to_dict()
+        payload.pop("rubric")
+        restored = load_verification_report(payload)
+        self.assertIsNotNone(restored.rubric)
+        self.assertEqual(restored.rubric.minimum_score, 3)
+        self.assertEqual(restored.verdict, "CONDITIONAL")
+
+        dup_payload = _ready_report(findings=[MAJOR]).to_dict()
+        dup_payload["findings"].append(dict(dup_payload["findings"][0]))
+        with self.assertRaises(ValueError) as ctx:
+            load_verification_report(dup_payload)
+        self.assertIn("M1", str(ctx.exception))
+
 
 class ReportRenderingTests(unittest.TestCase):
     def test_markdown_contains_metadata_invariants_rubric_and_findings(self) -> None:
@@ -386,6 +404,44 @@ class DedupTests(unittest.TestCase):
             path = Path(td) / "issues.json"
             path.write_text(json.dumps(raw), encoding="utf-8")
             self.assertEqual(load_open_issues(path)[0].number, 7)
+
+    def test_identifier_tokens_ignore_numeric_timestamps_and_bare_suffixes(self) -> None:
+        tokens = _identifier_tokens(
+            [
+                "19",
+                "00",
+                "01",
+                "2026",
+                "error",
+                "crash",
+                "exception",
+                "ошибка",
+                "падение",
+                "краш",
+                "nullpointerexception",
+                "http503",
+                "runtimeerror",
+            ]
+        )
+        self.assertEqual(tokens, {"nullpointerexception", "http503", "runtimeerror"})
+
+        finding = Finding(
+            id="TS1",
+            title="Кнопка экспорта не сохраняет файл",
+            severity="Minor",
+            screen="export",
+            actual="Ошибка в 19:00:01 при нажатии",
+            logcat_excerpt="11-24 19:00:01.000 E App: error",
+        )
+        unrelated_issue = OpenIssue(
+            number=201,
+            title="Проблема загрузки карты",
+            body="Ошибка в 19:00:01, crash лог без стека",
+            url="https://github.com/rumap/rumap-android/issues/201",
+        )
+        score, reasons = score_against_issue(finding, unrelated_issue)
+        self.assertFalse(any("идентификаторы ошибки" in reason for reason in reasons))
+        self.assertLess(score, 0.35)
 
 
 class IssueBodyTests(unittest.TestCase):
@@ -766,6 +822,140 @@ class IssuesCliTests(unittest.TestCase):
         )
         self.assertEqual([item.finding_id for item in res_allow.created], ["P1"])
         self.assertEqual(len(fake_allow.calls), 1)
+
+    def test_explicit_owner_approval_overrides_duplicate_and_adds_default_triage_label(self) -> None:
+        plan = deduplicate_findings([BLOCKER, MAJOR], OPEN_ISSUES)
+        self.assertEqual(plan.entries[0].status, "duplicate")
+
+        # approve_all_new still skips duplicate
+        fake_skip = _FakeRunner()
+        res_skip = create_approved_issues(
+            plan,
+            repo="rumap/rumap-android",
+            owner_approved=True,
+            approve_all_new=True,
+            runner=fake_skip,
+        )
+        self.assertEqual([c.finding_id for c in res_skip.created], ["M1"])
+        self.assertEqual(res_skip.skipped, ["B1"])
+        self.assertIn("status:needs-triage", DEFAULT_ISSUE_LABELS)
+        self.assertIn("--label", fake_skip.calls[0])
+        self.assertIn("status:needs-triage", fake_skip.calls[0])
+        self.assertNotIn("--assignee", fake_skip.calls[0])
+
+        # explicit owner approval overrides duplicate
+        fake_override = _FakeRunner()
+        res_override = create_approved_issues(
+            plan,
+            repo="rumap/rumap-android",
+            owner_approved=True,
+            approved_finding_ids=["B1"],
+            runner=fake_override,
+        )
+        self.assertEqual([c.finding_id for c in res_override.created], ["B1"])
+        self.assertEqual(res_override.skipped, [])
+        self.assertEqual(fake_override.calls[0].count("status:needs-triage"), 1)
+
+        # explicit status:* label is preserved without adding duplicate status:needs-triage
+        custom_status = Finding(
+            id="S1",
+            title="Уникальная находка с явным статусом",
+            severity="Minor",
+            labels=["bug", "status:needs-owner"],
+        )
+        custom_plan = deduplicate_findings([custom_status], [])
+        fake_custom = _FakeRunner()
+        create_approved_issues(
+            custom_plan,
+            repo="rumap/rumap-android",
+            owner_approved=True,
+            approved_finding_ids=["S1"],
+            runner=fake_custom,
+        )
+        self.assertIn("status:needs-owner", fake_custom.calls[0])
+        self.assertNotIn("status:needs-triage", fake_custom.calls[0])
+
+    def test_mid_batch_failure_preserves_created_issues_in_exception_and_cli_json(self) -> None:
+        plan = deduplicate_findings([BLOCKER, MAJOR, UX_POLISH], OPEN_ISSUES)
+        runner = _FakeRunner(
+            [
+                CommandResult(returncode=0, stdout=b"https://github.com/rumap/rumap-android/issues/801\n"),
+                CommandResult(returncode=1, stderr=b"secondary rate limit"),
+            ]
+        )
+        with self.assertRaises(IssueCreationError) as ctx:
+            create_approved_issues(
+                plan,
+                repo="rumap/rumap-android",
+                owner_approved=True,
+                approve_all_new=True,
+                runner=runner,
+            )
+        self.assertEqual([c.finding_id for c in ctx.exception.result.created], ["M1"])
+        self.assertEqual(ctx.exception.result.created[0].number, 801)
+        self.assertEqual([f.finding_id for f in ctx.exception.result.failed], ["U1"])
+        self.assertIn("rate limit", ctx.exception.result.failed[0].error)
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            run_path, issues_path = self._write_inputs(root)
+            cli_runner = _FakeRunner(
+                [
+                    CommandResult(returncode=0, stdout=b"https://github.com/rumap/rumap-android/issues/802\n"),
+                    CommandResult(returncode=1, stderr=b"HTTP 422 label missing"),
+                ]
+            )
+            with mock.patch("app_verify.issues.SubprocessRunner", return_value=cli_runner):
+                out = io.StringIO()
+                err = io.StringIO()
+                rc = run_cli(
+                    [
+                        "--json",
+                        "issues",
+                        "create",
+                        "--input",
+                        str(run_path),
+                        "--repo",
+                        "rumap/rumap-android",
+                        "--open-issues",
+                        str(issues_path),
+                        "--approve-all-new",
+                        "--confirm-owner-approval",
+                    ],
+                    stdout=out,
+                    stderr=err,
+                )
+            self.assertEqual(rc, 1)
+            payload = json.loads(out.getvalue())
+            self.assertFalse(payload["ok"])
+            self.assertIn("HTTP 422", payload["error"])
+            self.assertEqual([c["finding_id"] for c in payload["created"]], ["M1"])
+            self.assertEqual(payload["created"][0]["number"], 802)
+            self.assertEqual([f["finding_id"] for f in payload["failed"]], ["U1"])
+
+    def test_cli_missing_input_or_open_issues_reports_file_not_found(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            missing_run = root / "missing-run.json"
+            out = io.StringIO()
+            rc = run_cli(["--json", "report", "--input", str(missing_run)], stdout=out, stderr=io.StringIO())
+            self.assertEqual(rc, 1)
+            err_msg = json.loads(out.getvalue())["error"]
+            self.assertIn("No such file", err_msg)
+            self.assertNotIn("Expecting value", err_msg)
+
+            run_path, _ = self._write_inputs(root)
+            missing_issues = root / "missing-issues.json"
+            out2 = io.StringIO()
+            rc2 = run_cli(
+                ["--json", "issues", "dedup", "--input", str(run_path), "--open-issues", str(missing_issues)],
+                stdout=out2,
+                stderr=io.StringIO(),
+            )
+            self.assertEqual(rc2, 1)
+            err_msg2 = json.loads(out2.getvalue())["error"]
+            self.assertIn("No such file", err_msg2)
+            self.assertNotIn("Expecting value", err_msg2)
 
 
 if __name__ == "__main__":

@@ -89,8 +89,10 @@ python3 scripts/app-verify.py --json debug mock-state --preset clear
 # Сброс локальной БД/настроек и debug-overlay
 python3 scripts/app-verify.py --json debug reset-state
 
-# Read-only дамп диагностики
-python3 scripts/app-verify.py --json debug dump-diagnostics --output-path diag.json
+# Read-only дамп диагностики (сохранить JSON локально на VPS через --output;
+# опционально --device-output-path для записи внутри cacheDir на устройстве, алиас: --output-path)
+python3 scripts/app-verify.py --json debug dump-diagnostics \
+  --output .scratch/app-verify-<ts>/diag.json
 ```
 
 Допустимые `--target`: `home`, `main`, `check`, `settings`, `region`, `anchors`,
@@ -151,7 +153,7 @@ python3 scripts/app-verify.py --json stop
       "screenshots": ["artifacts/settings-crash.png"],
       "logcat_excerpt": "...",
       "category": "stability",
-      "labels": ["bug"]
+      "labels": ["bug", "status:needs-triage"]
     }
   ],
   "rubric": {
@@ -183,9 +185,9 @@ python3 scripts/app-verify.py --json issues dedup \
   --open-issues .scratch/app-verify-<ts>/open-issues.json
 ```
 
-Дедупликатор делит находки на точные дубли (пропускаются всегда), возможные дубли (пропускаются при
-`--approve-all-new`, но могут быть явно одобрены владельцем через `--approve <id>`) и новые кандидаты.
-Отправь владельцу в чат T3 сводку и ключевые скриншоты.
+Дедупликатор делит находки на точные дубли, возможные дубли (оба класса пропускаются при
+`--approve-all-new`, но владелец может явно переопределить любой ID через `--approve <id>`)
+и новые кандидаты. Отправь владельцу в чат T3 сводку и ключевые скриншоты.
 
 ### 7. Owner-gate для GitHub Issues
 
@@ -202,8 +204,10 @@ python3 scripts/app-verify.py --json issues create \
 ```
 
 Без `--confirm-owner-approval` команда завершается ошибкой и не вызывает `gh issue create`.
-`--dry-run` безопасно показывает план (в том числе с `--approve-all-new`). Точные дубли
-не создаются никогда.
+`--dry-run` безопасно показывает план (в том числе с `--approve-all-new`). По умолчанию новым
+багам добавляется метка `status:needs-triage` (если не указана другая `status:*`-метка) без
+`assignee`. При `--approve-all-new` дубли и возможные дубли пропускаются; явное указание ID
+в `--approve` позволяет владельцу переопределить решение дедупликатора.
 
 ## Жёсткие правила
 

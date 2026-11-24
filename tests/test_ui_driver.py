@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import base64
 import io
 import json
 import os
@@ -12,15 +13,18 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from app_verify.android import PNG_SIGNATURE
 from app_verify.cli import run_cli
 from app_verify.core import StandError
 from app_verify.ui_driver import (
     DEFAULT_MOBILE_MCP_PACKAGE,
+    McpToolResult,
     MobileMcpClient,
     build_mcp_server_config,
     build_ui_driver_env,
     call_ui_driver_tool,
     check_ui_driver,
+    derive_android_sdk_root,
     resolve_mobilecli_command,
     resolve_ui_driver_command,
     stop_mobilecli_daemon,
@@ -50,6 +54,40 @@ class UiDriverEnvAndConfigTests(unittest.TestCase):
             self.assertEqual(env["MOBILEMCP_DISABLE_TELEMETRY"], "1")
             self.assertEqual(env["DO_NOT_TRACK"], "1")
             self.assertEqual(env["MOBILECLI_DEVICE"], "127.0.0.1:15565")
+
+    def test_build_ui_driver_env_moves_adb_dir_to_front_and_resolves_symlink_sdk_root(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            sdk_root = root / "real-sdk"
+            platform_tools = sdk_root / "platform-tools"
+            platform_tools.mkdir(parents=True)
+            adb_real = platform_tools / "adb"
+            adb_real.write_text("#!/bin/sh\n", encoding="utf-8")
+            adb_real.chmod(0o755)
+
+            symlink_dir = root / "bin"
+            symlink_dir.mkdir()
+            adb_link = symlink_dir / "adb"
+            adb_link.symlink_to(adb_real)
+
+            self.assertEqual(derive_android_sdk_root(adb_link), str(sdk_root.resolve()))
+
+            env = build_ui_driver_env(
+                adb_bin=str(adb_real),
+                device_id="127.0.0.1:15565",
+                base_env={"PATH": f"/usr/local/bin:{platform_tools}:/usr/bin:{platform_tools}"},
+            )
+            path_parts = env["PATH"].split(":")
+            self.assertEqual(path_parts[0], str(platform_tools))
+            self.assertEqual(path_parts.count(str(platform_tools)), 1)
+            self.assertEqual(path_parts[1:], ["/usr/local/bin", "/usr/bin"])
+
+            env_link = build_ui_driver_env(
+                adb_bin=str(adb_link),
+                device_id="127.0.0.1:15565",
+                base_env={"PATH": "/usr/bin"},
+            )
+            self.assertEqual(env_link["ANDROID_HOME"], str(sdk_root.resolve()))
 
     def test_resolve_ui_driver_command_prefers_direct_binary_and_falls_back_to_npx(self) -> None:
         with self.subTest("direct server binary"):
@@ -488,6 +526,56 @@ class UiDriverCliTests(unittest.TestCase):
         payload2 = json.loads(out2.getvalue())
         self.assertFalse(payload2["ok"])
         self.assertIn("--timeout", payload2["error"])
+
+    def test_cli_ui_driver_call_save_image_writes_png_and_errors_when_no_image(self) -> None:
+        fake_png = PNG_SIGNATURE + b"\x00\x01\x02\x03" * 8
+        b64_png = base64.b64encode(fake_png).decode("ascii")
+        img_res = McpToolResult(
+            content=[{"type": "image", "data": b64_png, "mimeType": "image/png"}],
+            text="",
+            images=[{"type": "image", "data": b64_png, "mimeType": "image/png"}],
+        )
+        with tempfile.TemporaryDirectory() as td:
+            out_png = Path(td) / "shots" / "screen.png"
+            with mock.patch("app_verify.cli.call_ui_driver_tool", return_value=img_res):
+                out = io.StringIO()
+                err = io.StringIO()
+                rc = run_cli(
+                    [
+                        "--json",
+                        "ui-driver",
+                        "call",
+                        "mobile_take_screenshot",
+                        "--save-image",
+                        str(out_png),
+                    ],
+                    stdout=out,
+                    stderr=err,
+                )
+            self.assertEqual(rc, 0, err.getvalue())
+            payload = json.loads(out.getvalue())
+            self.assertTrue(payload["ok"])
+            self.assertEqual(payload["image_count"], 1)
+            self.assertEqual(payload["saved_images"], [str(out_png)])
+            self.assertEqual(out_png.read_bytes(), fake_png)
+
+            empty_res = McpToolResult(content=[{"type": "text", "text": "ok"}], text="ok", images=[])
+            with mock.patch("app_verify.cli.call_ui_driver_tool", return_value=empty_res):
+                out2 = io.StringIO()
+                rc2 = run_cli(
+                    [
+                        "--json",
+                        "ui-driver",
+                        "call",
+                        "mobile_list_elements_on_screen",
+                        "--save-image",
+                        str(Path(td) / "nope.png"),
+                    ],
+                    stdout=out2,
+                    stderr=io.StringIO(),
+                )
+            self.assertEqual(rc2, 1)
+            self.assertFalse(json.loads(out2.getvalue())["ok"])
 
 
 if __name__ == "__main__":

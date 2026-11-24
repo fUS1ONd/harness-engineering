@@ -10,12 +10,13 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from .android import CommandRunner, SubprocessRunner
-from .core import StandError
+from .core import StandError, is_existing_file
 from .report import Finding
 
 DUPLICATE_THRESHOLD = 0.58
 POSSIBLE_THRESHOLD = 0.35
 GH_ISSUE_LIST_JSON = "number,title,body,labels,url,state"
+DEFAULT_ISSUE_LABELS = ("status:needs-triage",)
 URL_PATTERN = re.compile(r"https?://\S+?/issues/(\d+)")
 
 _STOPWORDS = frozenset(
@@ -173,10 +174,25 @@ class CreatedIssue:
         }
 
 
+@dataclass(frozen=True)
+class FailedIssue:
+    finding_id: str
+    title: str
+    error: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "finding_id": self.finding_id,
+            "title": self.title,
+            "error": self.error,
+        }
+
+
 @dataclass
 class IssueFilingResult:
     planned: list[PlannedIssue] = field(default_factory=list)
     created: list[CreatedIssue] = field(default_factory=list)
+    failed: list[FailedIssue] = field(default_factory=list)
     skipped: list[str] = field(default_factory=list)
     dry_run: bool = False
 
@@ -185,8 +201,17 @@ class IssueFilingResult:
             "dry_run": self.dry_run,
             "planned": [item.to_dict() for item in self.planned],
             "created": [item.to_dict() for item in self.created],
+            "failed": [item.to_dict() for item in self.failed],
             "skipped": list(self.skipped),
         }
+
+
+class IssueCreationError(StandError):
+    """Ошибка создания GitHub Issues с сохранением частично созданных issue."""
+
+    def __init__(self, message: str, *, result: IssueFilingResult) -> None:
+        super().__init__(message)
+        self.result = result
 
 
 @dataclass
@@ -267,11 +292,14 @@ def _normalized_text(text: str) -> str:
 
 
 def _identifier_tokens(tokens: Iterable[str]) -> set[str]:
-    return {
-        token
-        for token in tokens
-        if any(ch.isdigit() for ch in token) or token.endswith(_IDENTIFIER_SUFFIXES)
-    }
+    result: set[str] = set()
+    for token in tokens:
+        if any(ch.isdigit() for ch in token) and any(ch.isalpha() for ch in token):
+            result.add(token)
+            continue
+        if any(token.endswith(suffix) and len(token) > len(suffix) for suffix in _IDENTIFIER_SUFFIXES):
+            result.add(token)
+    return result
 
 
 def score_against_issue(finding: Finding, issue: OpenIssue) -> tuple[float, list[str]]:
@@ -405,16 +433,6 @@ def render_dedup_markdown(plan: DedupPlan) -> str:
     return "\n".join(lines).rstrip()
 
 
-def _is_existing_file(text: str) -> bool:
-    stripped = text.lstrip()
-    if stripped.startswith("{") or stripped.startswith("["):
-        return False
-    try:
-        return Path(text).exists()
-    except OSError:
-        return False
-
-
 def load_open_issues(source: Iterable[Mapping[str, Any]] | Mapping[str, Any] | str | Path) -> list[OpenIssue]:
     """Загружает открытые issue из списка, gh-JSON, файла или JSON-строки."""
     if isinstance(source, Mapping):
@@ -423,7 +441,7 @@ def load_open_issues(source: Iterable[Mapping[str, Any]] | Mapping[str, Any] | s
         payload = json.loads(source.read_text(encoding="utf-8"))
         raw = payload.get("issues", []) if isinstance(payload, Mapping) else payload
     elif isinstance(source, str):
-        payload = json.loads(Path(source).read_text(encoding="utf-8") if _is_existing_file(source) else source)
+        payload = json.loads(Path(source).read_text(encoding="utf-8") if is_existing_file(source) else source)
         raw = payload.get("issues", []) if isinstance(payload, Mapping) else payload
     else:
         raw = list(source)
@@ -547,6 +565,26 @@ def format_issue_body(finding: Finding, report_meta: Mapping[str, Any] | Any | N
     return "\n".join(lines).rstrip() + "\n"
 
 
+def _resolve_issue_labels(
+    finding_labels: Iterable[str],
+    default_labels: Iterable[str] = DEFAULT_ISSUE_LABELS,
+) -> list[str]:
+    labels: list[str] = []
+    for raw in finding_labels:
+        label = str(raw).strip()
+        if label and label not in labels:
+            labels.append(label)
+    has_status = any(label.startswith("status:") for label in labels)
+    for raw in default_labels:
+        label = str(raw).strip()
+        if not label or label in labels:
+            continue
+        if label.startswith("status:") and has_status:
+            continue
+        labels.append(label)
+    return labels
+
+
 def create_approved_issues(
     plan: DedupPlan,
     *,
@@ -554,14 +592,17 @@ def create_approved_issues(
     owner_approved: bool = False,
     approved_finding_ids: Iterable[str] | None = None,
     approve_all_new: bool = False,
+    default_labels: Iterable[str] = DEFAULT_ISSUE_LABELS,
     runner: CommandRunner | None = None,
     report_meta: Mapping[str, Any] | Any | None = None,
     dry_run: bool = False,
 ) -> IssueFilingResult:
-    """Заводит issue только для явно одобренных владельцем новых находок.
+    """Заводит issue только для явно одобренных владельцем находок.
 
     Без ``owner_approved=True`` и явного списка ID (или ``approve_all_new``) функция
     поднимает ``OwnerApprovalRequiredError`` и не выполняет ни одной команды.
+    При ``approve_all_new=True`` дубли и возможные дубли пропускаются; явный список
+    ``approved_finding_ids`` позволяет владельцу переопределить решение дедупликатора.
     """
     approved = [str(item) for item in (approved_finding_ids or [])]
 
@@ -587,23 +628,18 @@ def create_approved_issues(
     skipped: list[str] = []
     for match in plan.entries:
         explicitly_approved = match.finding.id in approved
-        wants_creation = approve_all_new or explicitly_approved
-        if match.status == "duplicate":
-            if wants_creation:
-                skipped.append(match.finding.id)
-            continue
-        if match.status == "possible_duplicate":
+        if match.status in ("duplicate", "possible_duplicate"):
             if explicitly_approved:
                 selected.append(match)
             elif approve_all_new:
                 skipped.append(match.finding.id)
             continue
-        if wants_creation:
+        if approve_all_new or explicitly_approved:
             selected.append(match)
 
     planned: list[PlannedIssue] = []
     for match in selected:
-        labels = list(match.finding.labels)
+        labels = _resolve_issue_labels(match.finding.labels, default_labels=default_labels)
         planned.append(
             PlannedIssue(
                 finding=match.finding,
@@ -613,7 +649,7 @@ def create_approved_issues(
             )
         )
 
-    result = IssueFilingResult(planned=planned, created=[], skipped=skipped, dry_run=dry_run)
+    result = IssueFilingResult(planned=planned, created=[], failed=[], skipped=skipped, dry_run=dry_run)
     if dry_run:
         return result
 
@@ -622,14 +658,26 @@ def create_approved_issues(
         argv = ["gh", "issue", "create", "--repo", repo, "--title", item.title, "--body", item.body]
         for label in item.labels:
             argv.extend(["--label", label])
-        command_result = runner.run(argv, timeout=60.0)
+        try:
+            command_result = runner.run(argv, timeout=60.0)
+        except StandError as exc:
+            details = str(exc)
+            result.failed.append(FailedIssue(finding_id=item.finding.id, title=item.title, error=details))
+            raise IssueCreationError(
+                f"Не удалось создать issue '{item.title}': {details}",
+                result=result,
+            ) from exc
         if command_result.returncode != 0:
             details = (
                 command_result.stderr_text.strip()
                 or command_result.stdout_text.strip()
                 or f"code={command_result.returncode}"
             )
-            raise StandError(f"Не удалось создать issue '{item.title}': {details}")
+            result.failed.append(FailedIssue(finding_id=item.finding.id, title=item.title, error=details))
+            raise IssueCreationError(
+                f"Не удалось создать issue '{item.title}': {details}",
+                result=result,
+            )
         match = URL_PATTERN.search(command_result.stdout_text or "")
         url = match.group(0) if match else ""
         number = int(match.group(1)) if match else None
