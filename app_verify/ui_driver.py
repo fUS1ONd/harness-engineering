@@ -18,6 +18,7 @@ from .core import StandError
 DEFAULT_MOBILE_MCP_PACKAGE = "@mobilenext/mobile-mcp@1.0.20"
 DEFAULT_DEVICE_ID = "127.0.0.1:15565"
 MCP_PROTOCOL_VERSION = "2024-11-05"
+MAX_STDERR_BUFFER_BYTES = 16384
 
 
 @dataclass(frozen=True)
@@ -58,10 +59,12 @@ def build_ui_driver_env(
     adb_bin: str | None = None,
     device_id: str | None = DEFAULT_DEVICE_ID,
     base_env: Mapping[str, str] | None = None,
+    which_fn: Callable[[str], str | None] | None = None,
 ) -> dict[str, str]:
     """Собирает окружение для `@mobilenext/mobile-mcp` с гарантированным `adb` и `ANDROID_HOME`."""
+    which = shutil.which if which_fn is None else which_fn
     environ = dict(os.environ if base_env is None else base_env)
-    adb_path = Path(find_local_adb(adb_bin, env=environ))
+    adb_path = Path(find_local_adb(adb_bin, env=environ, which_fn=which))
     adb_dir = str(adb_path.parent)
 
     current_path = environ.get("PATH", "")
@@ -71,8 +74,10 @@ def build_ui_driver_env(
 
     sdk_root = derive_android_sdk_root(adb_path)
     if sdk_root:
-        environ.setdefault("ANDROID_HOME", sdk_root)
-        environ.setdefault("ANDROID_SDK_ROOT", sdk_root)
+        if adb_bin or not environ.get("ANDROID_HOME"):
+            environ["ANDROID_HOME"] = sdk_root
+        if adb_bin or not environ.get("ANDROID_SDK_ROOT"):
+            environ["ANDROID_SDK_ROOT"] = sdk_root
 
     environ.setdefault("MOBILEMCP_DISABLE_TELEMETRY", "1")
     environ.setdefault("DO_NOT_TRACK", "1")
@@ -85,14 +90,15 @@ def build_ui_driver_env(
 def resolve_ui_driver_command(
     *,
     package: str = DEFAULT_MOBILE_MCP_PACKAGE,
-    which_fn: Callable[[str], str | None] = shutil.which,
+    which_fn: Callable[[str], str | None] | None = None,
 ) -> list[str]:
     """Возвращает базовую команду запуска `@mobilenext/mobile-mcp`."""
-    direct = which_fn("mcp-server-mobile")
+    which = shutil.which if which_fn is None else which_fn
+    direct = which("mcp-server-mobile")
     if direct:
         return [direct]
 
-    npx_bin = which_fn("npx")
+    npx_bin = which("npx")
     if npx_bin:
         return [npx_bin, "--yes", package]
 
@@ -105,14 +111,15 @@ def resolve_ui_driver_command(
 def resolve_mobilecli_command(
     *,
     package: str = DEFAULT_MOBILE_MCP_PACKAGE,
-    which_fn: Callable[[str], str | None] = shutil.which,
+    which_fn: Callable[[str], str | None] | None = None,
 ) -> list[str] | None:
     """Возвращает команду запуска `mobilecli` (напрямую или через `npx -p <package>`)."""
-    direct = which_fn("mobilecli")
+    which = shutil.which if which_fn is None else which_fn
+    direct = which("mobilecli")
     if direct:
         return [direct]
 
-    npx_bin = which_fn("npx")
+    npx_bin = which("npx")
     if npx_bin:
         return [npx_bin, "--yes", "-p", package, "mobilecli"]
 
@@ -123,7 +130,7 @@ def stop_mobilecli_daemon(
     *,
     package: str = DEFAULT_MOBILE_MCP_PACKAGE,
     env: Mapping[str, str] | None = None,
-    which_fn: Callable[[str], str | None] = shutil.which,
+    which_fn: Callable[[str], str | None] | None = None,
     run_fn: Callable[..., Any] = subprocess.run,
 ) -> bool:
     """Останавливает фоновый демон `mobilecli`, если он закэшировал пустой список устройств."""
@@ -174,11 +181,11 @@ def build_mcp_server_config(
     device_id: str | None = DEFAULT_DEVICE_ID,
     package: str = DEFAULT_MOBILE_MCP_PACKAGE,
     base_env: Mapping[str, str] | None = None,
-    which_fn: Callable[[str], str | None] = shutil.which,
+    which_fn: Callable[[str], str | None] | None = None,
 ) -> dict[str, Any]:
     """Формирует фрагмент MCP-конфигурации (`mcpServers`) для подключения агента к стенду."""
     cmd = resolve_ui_driver_command(package=package, which_fn=which_fn)
-    env = build_ui_driver_env(adb_bin=adb_bin, device_id=device_id, base_env=base_env)
+    env = build_ui_driver_env(adb_bin=adb_bin, device_id=device_id, base_env=base_env, which_fn=which_fn)
 
     config_env = {
         key: env[key]
@@ -217,9 +224,12 @@ class MobileMcpClient:
         self._command = list(command)
         self._env = dict(env) if env is not None else None
         self._timeout_s = timeout_s
-        self._proc: subprocess.Popen[str] | None = None
+        self._proc: subprocess.Popen[bytes] | None = None
         self._next_id = 1
         self._initialized = False
+        self._stdout_buf = bytearray()
+        self._stderr_buf = bytearray()
+        self._stderr_eof = False
 
     def __enter__(self) -> MobileMcpClient:
         self.start()
@@ -231,58 +241,109 @@ class MobileMcpClient:
     def start(self) -> None:
         if self._proc is not None:
             return
+        self._stdout_buf.clear()
+        self._stderr_buf.clear()
+        self._stderr_eof = False
         try:
+            # Используем небуферизованный бинарный режим, чтобы selectors.select()
+            # не рассинхронизировался с внутренним буфером TextIOWrapper.
             self._proc = subprocess.Popen(
                 self._command,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
+                bufsize=0,
                 env=self._env,
             )
-        except FileNotFoundError as exc:
-            raise StandError(f"Не удалось запустить UI-драйвер: {self._command[0]} не найден") from exc
+        except OSError as exc:
+            raise StandError(f"Не удалось запустить UI-драйвер ({self._command[0]}): {exc}") from exc
 
     def close(self) -> None:
         proc = self._proc
+        self._proc = None
+        self._initialized = False
+        self._stdout_buf.clear()
+        self._stderr_buf.clear()
+        self._stderr_eof = False
         if proc is None:
             return
-        self._proc = None
         try:
-            if proc.stdin and not proc.stdin.closed:
-                proc.stdin.close()
-        except OSError:
-            pass
-        try:
-            proc.wait(timeout=2.0)
-        except subprocess.TimeoutExpired:
-            proc.terminate()
+            try:
+                if proc.stdin and not proc.stdin.closed:
+                    proc.stdin.close()
+            except OSError:
+                pass
             try:
                 proc.wait(timeout=2.0)
             except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait(timeout=2.0)
-        for pipe in (proc.stdout, proc.stderr):
-            try:
-                if pipe and not pipe.closed:
-                    pipe.close()
+                proc.terminate()
+                try:
+                    proc.wait(timeout=2.0)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    try:
+                        proc.wait(timeout=2.0)
+                    except (subprocess.TimeoutExpired, OSError):
+                        pass
             except OSError:
                 pass
+        finally:
+            for pipe in (proc.stdout, proc.stderr):
+                try:
+                    if pipe and not pipe.closed:
+                        pipe.close()
+                except OSError:
+                    pass
 
     def _send(self, payload: dict[str, Any]) -> None:
         if self._proc is None or self._proc.stdin is None:
             raise StandError("MCP-процесс не запущен")
-        line = json.dumps(payload, ensure_ascii=False) + "\n"
-        self._proc.stdin.write(line)
-        self._proc.stdin.flush()
+        raw = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
+        try:
+            self._proc.stdin.write(raw)
+            self._proc.stdin.flush()
+        except OSError as exc:
+            raise StandError(f"Ошибка записи в stdin UI-драйвера: {exc}") from exc
+
+    def _pop_stdout_message(self) -> dict[str, Any] | None:
+        while True:
+            nl = self._stdout_buf.find(b"\n")
+            if nl == -1:
+                return None
+            raw_line = bytes(self._stdout_buf[:nl])
+            del self._stdout_buf[: nl + 1]
+            stripped = raw_line.decode("utf-8", errors="replace").strip()
+            if not stripped:
+                continue
+            try:
+                parsed = json.loads(stripped)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict):
+                return parsed
+
+    def _append_stderr(self, chunk: bytes) -> None:
+        if not chunk:
+            return
+        self._stderr_buf.extend(chunk)
+        if len(self._stderr_buf) > MAX_STDERR_BUFFER_BYTES:
+            del self._stderr_buf[: len(self._stderr_buf) - MAX_STDERR_BUFFER_BYTES]
 
     def _read_message(self, deadline: float) -> dict[str, Any]:
         if self._proc is None or self._proc.stdout is None:
             raise StandError("MCP-процесс не запущен")
+
+        cached = self._pop_stdout_message()
+        if cached is not None:
+            return cached
+
+        stdout_fd = self._proc.stdout.fileno()
+        stderr_fd = self._proc.stderr.fileno() if self._proc.stderr is not None else None
+
         sel = selectors.DefaultSelector()
-        sel.register(self._proc.stdout, selectors.EVENT_READ)
+        sel.register(stdout_fd, selectors.EVENT_READ, data="stdout")
+        if stderr_fd is not None and not self._stderr_eof:
+            sel.register(stderr_fd, selectors.EVENT_READ, data="stderr")
         try:
             while True:
                 remaining = deadline - time.monotonic()
@@ -291,24 +352,31 @@ class MobileMcpClient:
                 events = sel.select(timeout=remaining)
                 if not events:
                     raise StandError(f"Таймаут ожидания ответа от UI-драйвера ({self._timeout_s}s)")
-                line = self._proc.stdout.readline()
-                if line == "":
-                    stderr_tail = ""
-                    if self._proc.stderr is not None:
+                for key, _mask in events:
+                    if key.data == "stderr":
                         try:
-                            stderr_tail = self._proc.stderr.read().strip()
+                            chunk = os.read(key.fd, 4096)
                         except OSError:
-                            pass
-                    raise StandError(
-                        f"UI-драйвер неожиданно завершил работу (rc={self._proc.poll()}): {stderr_tail}"
-                    )
-                stripped = line.strip()
-                if not stripped:
-                    continue
-                try:
-                    return json.loads(stripped)
-                except json.JSONDecodeError:
-                    continue
+                            chunk = b""
+                        if not chunk:
+                            self._stderr_eof = True
+                            sel.unregister(key.fd)
+                        else:
+                            self._append_stderr(chunk)
+                    elif key.data == "stdout":
+                        try:
+                            chunk = os.read(key.fd, 65536)
+                        except OSError as exc:
+                            raise StandError(f"Ошибка чтения stdout UI-драйвера: {exc}") from exc
+                        if not chunk:
+                            stderr_tail = self._stderr_buf.decode("utf-8", errors="replace").strip()
+                            raise StandError(
+                                f"UI-драйвер неожиданно завершил работу (rc={self._proc.poll()}): {stderr_tail}"
+                            )
+                        self._stdout_buf.extend(chunk)
+                msg = self._pop_stdout_message()
+                if msg is not None:
+                    return msg
         finally:
             sel.close()
 
@@ -329,8 +397,11 @@ class MobileMcpClient:
                 continue
             if "error" in msg and msg["error"] is not None:
                 err = msg["error"]
-                raise StandError(f"MCP error ({method}): {err.get('message', err)}")
-            return msg.get("result", {})
+                if isinstance(err, dict):
+                    raise StandError(f"MCP error ({method}): {err.get('message', err)}")
+                raise StandError(f"MCP error ({method}): {err}")
+            result = msg.get("result")
+            return result if isinstance(result, dict) else {}
 
     def initialize(self) -> dict[str, Any]:
         if self._initialized:
@@ -391,21 +462,27 @@ def check_ui_driver(
     require_device: bool = False,
     base_env: Mapping[str, str] | None = None,
     command_override: list[str] | None = None,
-    which_fn: Callable[[str], str | None] = shutil.which,
+    which_fn: Callable[[str], str | None] | None = None,
     timeout_s: float = 30.0,
     adb_online_fn: Callable[[str, str, Mapping[str, str] | None], bool] | None = None,
     stop_daemon_fn: Callable[[str, Mapping[str, str] | None], bool] | None = None,
 ) -> UiDriverStatus:
     """Проверяет доступность UI-драйвера (`adb`, Node/npx, при `probe_mcp=True` — MCP-рукопожатие)."""
+    which = shutil.which if which_fn is None else which_fn
     try:
-        env = build_ui_driver_env(adb_bin=adb_bin, device_id=device_id, base_env=base_env)
-        resolved_adb = find_local_adb(adb_bin, env=env, which_fn=which_fn)
+        env = build_ui_driver_env(
+            adb_bin=adb_bin,
+            device_id=device_id,
+            base_env=base_env,
+            which_fn=which,
+        )
+        resolved_adb = find_local_adb(adb_bin, env=env, which_fn=which)
         cmd = (
             list(command_override)
             if command_override is not None
-            else [*resolve_ui_driver_command(package=package, which_fn=which_fn), "--stdio"]
+            else [*resolve_ui_driver_command(package=package, which_fn=which), "--stdio"]
         )
-        node_bin = which_fn("node")
+        node_bin = which("node")
         if command_override is None and not node_bin:
             raise StandError("Не найден `node` в PATH")
     except StandError as exc:
@@ -419,8 +496,27 @@ def check_ui_driver(
             error=str(exc),
         )
 
+    is_adb_online = adb_online_fn or (
+        lambda adb_p, dev_id, e: _is_adb_device_online(adb_p, dev_id, env=e)
+    )
+    stop_daemon = stop_daemon_fn or (
+        lambda pkg, e: stop_mobilecli_daemon(package=pkg, env=e, which_fn=which_fn)
+    )
+
     android_home = env.get("ANDROID_HOME")
     if not probe_mcp:
+        if require_device:
+            online = is_adb_online(resolved_adb, device_id, env)
+            return UiDriverStatus(
+                driver="mobile-mcp",
+                ready=online,
+                adb_path=resolved_adb,
+                android_home=android_home,
+                command=cmd,
+                device_id=device_id,
+                device_online=online,
+                error=None if online else f"Устройство {device_id} не найдено в adb devices в состоянии 'device'",
+            )
         return UiDriverStatus(
             driver="mobile-mcp",
             ready=True,
@@ -429,13 +525,6 @@ def check_ui_driver(
             command=cmd,
             device_id=device_id,
         )
-
-    is_adb_online = adb_online_fn or (
-        lambda adb_p, dev_id, e: _is_adb_device_online(adb_p, dev_id, env=e)
-    )
-    stop_daemon = stop_daemon_fn or (
-        lambda pkg, e: stop_mobilecli_daemon(package=pkg, env=e, which_fn=which_fn)
-    )
 
     try:
         with MobileMcpClient(cmd, env=env, timeout_s=timeout_s) as client:
@@ -484,10 +573,16 @@ def build_ui_driver_serve_spec(
     package: str = DEFAULT_MOBILE_MCP_PACKAGE,
     listen: str | None = None,
     base_env: Mapping[str, str] | None = None,
+    which_fn: Callable[[str], str | None] | None = None,
 ) -> tuple[list[str], dict[str, str]]:
     """Возвращает `(argv, env)` для запуска `@mobilenext/mobile-mcp` в режиме stdio или HTTP."""
-    env = build_ui_driver_env(adb_bin=adb_bin, device_id=device_id, base_env=base_env)
-    cmd = resolve_ui_driver_command(package=package)
+    env = build_ui_driver_env(
+        adb_bin=adb_bin,
+        device_id=device_id,
+        base_env=base_env,
+        which_fn=which_fn,
+    )
+    cmd = resolve_ui_driver_command(package=package, which_fn=which_fn)
     if listen:
         cmd.extend(["--listen", listen])
     else:

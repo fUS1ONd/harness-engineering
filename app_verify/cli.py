@@ -248,6 +248,11 @@ def run_cli(
 def _run_ui_driver_cli(args: argparse.Namespace, *, out: TextIO, err: TextIO) -> int:
     device_id = args.device or f"127.0.0.1:{args.local_adb_port}"
     try:
+        if args.platform.strip().lower() != "android":
+            raise StandError(
+                f"UI-драйвер поддерживается только для платформы 'android', получено: {args.platform!r}"
+            )
+
         if args.ui_driver_command == "mcp-config":
             cfg = build_mcp_server_config(
                 adb_bin=args.adb_bin,
@@ -275,10 +280,15 @@ def _run_ui_driver_cli(args: argparse.Namespace, *, out: TextIO, err: TextIO) ->
                 package=args.package,
                 listen=args.listen,
             )
-            os.execvpe(cmd[0], cmd, env)
+            try:
+                os.execvpe(cmd[0], cmd, env)
+            except OSError as exc:
+                raise StandError(f"Не удалось запустить UI-драйвер ({cmd[0]}): {exc}") from exc
             return 0
 
         if args.ui_driver_command == "call":
+            if args.timeout <= 0:
+                raise StandError(f"--timeout должен быть больше 0, получено: {args.timeout}")
             try:
                 parsed_args = json.loads(args.args_json)
             except json.JSONDecodeError as exc:
