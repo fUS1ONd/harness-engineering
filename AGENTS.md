@@ -28,6 +28,7 @@
 - **Агентская верификация приложений (`ssh home`):** [workflow/app-verification.md](workflow/app-verification.md) (`scripts/app-verify.py`)
 - **Авто-ревью и мердж коллабораторских PR:** [docs/pr-review-gate.md](docs/pr-review-gate.md) (`scripts/pr-review-gate.py`)
 - **Авто-триаж баг-issue (Benny):** [docs/issue-triage-gate.md](docs/issue-triage-gate.md) (`scripts/issue-triage-gate.py`)
+- **Релизный конвейер и прод-верификация (`rumap`):** [docs/release-train.md](docs/release-train.md) (`scripts/release-train.py`, `scripts/prod-smoke.py`)
 - **Инженерные принципы и ворота качества:** [standards/engineering.md](standards/engineering.md)
 
 ## Глобальные правила коммитов и контекста
