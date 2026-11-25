@@ -1065,6 +1065,24 @@ class GitHubAdapterTest(unittest.TestCase):
         create = next(call for call in calls if call[:3] == ("gh", "pr", "create"))
         self.assertEqual(create[create.index("--label") + 1], RELEASE_TRAIN_LABEL)
 
+    def test_default_targets_commands_expand_home_and_quote_custom_paths(self) -> None:
+        from release_train.deploy import default_targets
+
+        by_node = {target.node: target.command() for target in default_targets()}
+        self.assertTrue(by_node["center"].startswith("cd /opt/rumap-center && "))
+        self.assertTrue(by_node["worker-ru"].startswith('cd "$HOME"/rumap-v2/deploy/worker && '))
+        self.assertTrue(by_node["point"].startswith('cd "$HOME"/rumap-v2/deploy/point && '))
+        self.assertNotIn("'$HOME", by_node["worker-ru"])
+        self.assertNotIn("'$HOME", by_node["point"])
+
+        custom = DeployTarget(
+            layer="center",
+            node="custom",
+            host="host",
+            directory="/opt/my app; rm -rf /",
+        )
+        self.assertTrue(custom.command().startswith("cd '/opt/my app; rm -rf /' && "))
+
 
 class CliTest(unittest.TestCase):
     def test_scan_json_contract(self) -> None:

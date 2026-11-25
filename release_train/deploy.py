@@ -45,6 +45,16 @@ class SmokeOutcome:
         return tuple(self.report.get("failures") or ())
 
 
+def _quote_dir(path: str) -> str:
+    if path in {"$HOME", "~"}:
+        return '"$HOME"'
+    if path.startswith("$HOME/"):
+        return f'"$HOME"/{shlex.quote(path[len("$HOME/"):])}'
+    if path.startswith("~/"):
+        return f'"$HOME"/{shlex.quote(path[2:])}'
+    return shlex.quote(path)
+
+
 @dataclass(frozen=True)
 class DeployTarget:
     """Один узел слоя: каталог compose и префикс docker (`sudo -n` на home)."""
@@ -64,7 +74,7 @@ class DeployTarget:
         ]
         if self.prune:
             steps.append((*self.docker, "image", "prune", "-f"))
-        return f"cd {shlex.quote(self.directory)} && " + " && ".join(shlex.join(step) for step in steps)
+        return f"cd {_quote_dir(self.directory)} && " + " && ".join(shlex.join(step) for step in steps)
 
     def to_dict(self) -> dict:
         return {
@@ -91,7 +101,7 @@ def default_targets() -> tuple[DeployTarget, ...]:
             layer="worker",
             node="worker-ru",
             host="home",
-            directory='"$HOME/rumap-v2/deploy/worker"',
+            directory="$HOME/rumap-v2/deploy/worker",
             docker=("sudo", "-n", "docker"),
         ),
         DeployTarget(
@@ -106,7 +116,7 @@ def default_targets() -> tuple[DeployTarget, ...]:
             layer="point",
             node="point",
             host="home",
-            directory='"$HOME/rumap-v2/deploy/point"',
+            directory="$HOME/rumap-v2/deploy/point",
             docker=("sudo", "-n", "docker"),
             services=("rumapd",),
         ),
