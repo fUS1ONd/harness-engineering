@@ -340,6 +340,12 @@ def _promotion(
         return _noop(f"У release PR #{pr.number} нет зелёного CI.", {"pull_request": pr.to_dict()})
     if pr.mergeable != "MERGEABLE":
         return _noop(f"Release PR #{pr.number} пока {pr.mergeable}.", {"pull_request": pr.to_dict()})
+    if pr.head_sha != state.dev_sha:
+        return _noop(
+            f"Release PR #{pr.number} указывает на {short_sha(pr.head_sha)}, а `{state.head_branch}` "
+            f"на {short_sha(state.dev_sha)} — жду синхронизации headRefOid.",
+            {"pull_request": pr.to_dict(), "dev_sha": state.dev_sha},
+        )
     merge_details = dict(batch)
     merge_details["body_updated"] = BODY_MARKER.format(state.dev_sha) not in pr.body
     return Decision(

@@ -87,14 +87,15 @@ def extract_pr_number(message: str | None) -> int | None:
     return int(match.group(1)) if match else None
 
 
-def _check_rank(item: dict, index: int) -> tuple[int, str, str, str, int]:
+def _check_rank(item: dict, index: int) -> tuple[int, int, str, str, str, int]:
     completed = item.get("completedAt") or ""
     started = item.get("startedAt") or ""
     latest = completed if completed >= started else started
     status = (item.get("status") or "").upper()
     conclusion = (item.get("conclusion") or item.get("state") or "").upper()
+    non_skipped = 0 if (status == "COMPLETED" and conclusion in SKIPPED_CONCLUSIONS) else 1
     unstarted_pending = 1 if (not latest and (status in PENDING_STATES or conclusion in PENDING_STATES)) else 0
-    return (unstarted_pending, latest, completed, started, index)
+    return (non_skipped, unstarted_pending, latest, completed, started, index)
 
 
 def summarize_checks(
@@ -103,7 +104,7 @@ def summarize_checks(
     workflow_name: str | None = WORKFLOW_NAME,
 ) -> CheckSummary:
     """Сводит `statusCheckRollup` рабочего workflow к одному состоянию с дедупликацией перезапусков."""
-    latest_by_key: dict[tuple[str, str], tuple[tuple[int, str, str, str, int], dict]] = {}
+    latest_by_key: dict[tuple[str, str], tuple[tuple[int, int, str, str, str, int], dict]] = {}
     for index, item in enumerate(rollup or ()):
         item_workflow = item.get("workflowName") or ""
         if workflow_name is not None and item_workflow != workflow_name:

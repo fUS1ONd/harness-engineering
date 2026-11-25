@@ -522,6 +522,27 @@ class PromotionTest(unittest.TestCase):
         self.assertEqual(result["action"], "ci_failed")
         self.assertEqual(github.created, [])
 
+    def test_release_pr_with_stale_head_sha_waits_for_sync(self) -> None:
+        github, locks = FakeGitHub(), FakeLocks()
+        github.ci["dev"] = BranchCi("dev", (run_ok(DEV_SHA),))
+        github.compare_ = Comparison(ahead_by=1, commits=("feat: один",))
+        github.prs["main"] = [
+            make_pr(
+                64,
+                base="main",
+                head_ref="dev",
+                head_sha=OLDER_SHA,
+                body=f"<!-- release-train:head:{OLDER_SHA} -->",
+            )
+        ]
+
+        result = step(github, locks, REPO)
+
+        self.assertEqual(result["action"], "noop")
+        self.assertEqual(result["thread_action"], SETTLE)
+        self.assertEqual(github.merged, [])
+        self.assertEqual(github.updated, [])
+
 
 class CiFailureTest(unittest.TestCase):
     def test_failed_pr_ci_comments_and_settles_once(self) -> None:
@@ -1104,6 +1125,54 @@ class GitHubAdapterTest(unittest.TestCase):
         summary_pending = summarize_checks(rerun_in_progress)
         self.assertEqual(summary_pending.state, "pending")
         self.assertEqual(summary_pending.failed, ())
+
+    def test_summarize_checks_prefers_executed_check_over_later_skipped_duplicate(self) -> None:
+        skipped_over_success = [
+            {
+                "workflowName": "Проверка",
+                "name": "Задетые части",
+                "status": "COMPLETED",
+                "conclusion": "SUCCESS",
+                "startedAt": "2026-11-25T10:00:00Z",
+                "completedAt": "2026-11-25T10:01:00Z",
+            },
+            {
+                "workflowName": "Проверка",
+                "name": "Задетые части",
+                "status": "COMPLETED",
+                "conclusion": "SKIPPED",
+                "startedAt": "2026-11-25T10:02:00Z",
+                "completedAt": "2026-11-25T10:02:05Z",
+            },
+        ]
+        summary_ok = summarize_checks(skipped_over_success)
+        self.assertEqual(summary_ok.state, "passed")
+        self.assertEqual(summary_ok.passed, 1)
+        self.assertEqual(summary_ok.skipped, 0)
+
+        skipped_over_failure = [
+            {
+                "workflowName": "Проверка",
+                "name": "Задетые части",
+                "status": "COMPLETED",
+                "conclusion": "FAILURE",
+                "startedAt": "2026-11-25T10:00:00Z",
+                "completedAt": "2026-11-25T10:01:00Z",
+                "detailsUrl": RUN_URL,
+            },
+            {
+                "workflowName": "Проверка",
+                "name": "Задетые части",
+                "status": "COMPLETED",
+                "conclusion": "SKIPPED",
+                "startedAt": "2026-11-25T10:02:00Z",
+                "completedAt": "2026-11-25T10:02:05Z",
+            },
+        ]
+        summary_fail = summarize_checks(skipped_over_failure)
+        self.assertEqual(summary_fail.state, "failed")
+        self.assertEqual([check.name for check in summary_fail.failed], ["Задетые части"])
+        self.assertEqual(summary_fail.skipped, 0)
 
     def test_pull_request_parsing_and_changes_requested(self) -> None:
         item = {
