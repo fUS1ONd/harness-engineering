@@ -1,0 +1,55 @@
+name: Issue Triage Gate Trigger
+
+on:
+  issues:
+    types: [opened, labeled]
+  issue_comment:
+    types: [created]
+
+jobs:
+  notify:
+    if: >-
+      github.event.issue.pull_request == null &&
+      github.event.issue.assignee == null &&
+      !contains(github.event.issue.labels.*.name, 'status:in-progress') &&
+      !contains(github.event.issue.labels.*.name, 'status:blocked') &&
+      !contains(github.event.issue.labels.*.name, 'status:review') &&
+      !contains(github.event.issue.labels.*.name, 'contributor') &&
+      !contains(github.event.issue.labels.*.name, 'human-only') &&
+      !contains(github.event.issue.labels.*.name, 'enhancement') &&
+      !contains(github.event.issue.labels.*.name, 'question') &&
+      !contains(github.event.issue.labels.*.name, 'type:epic') &&
+      !contains(github.event.issue.labels.*.name, 'documentation') &&
+      !contains(github.event.issue.labels.*.name, 'duplicate') &&
+      !contains(github.event.issue.labels.*.name, 'invalid') &&
+      !contains(github.event.issue.labels.*.name, 'wontfix') &&
+      !contains(github.event.issue.labels.*.name, 'area:roadmap') &&
+      (
+        (github.event_name == 'issues' && github.event.action == 'opened' &&
+          !contains(github.event.issue.labels.*.name, 'status:ready-for-agent') &&
+          !contains(github.event.issue.labels.*.name, 'status:needs-owner')) ||
+        (github.event_name == 'issues' && github.event.action == 'labeled' && github.event.label.name == 'status:needs-triage') ||
+        (github.event_name == 'issue_comment' && github.event.action == 'created' &&
+          (contains(github.event.comment.body, '/benny') || contains(github.event.comment.body, '/triage')))
+      )
+    runs-on: ubuntu-latest
+    steps:
+      - name: Notify T3 Benny Issue Triage
+        env:
+          WEBHOOK_URL: ${{ secrets.T3_ISSUE_TRIAGE_WEBHOOK_URL }}
+          WEBHOOK_SECRET: ${{ secrets.T3_ISSUE_TRIAGE_WEBHOOK_SECRET }}
+          REPO: ${{ github.repository }}
+          ISSUE_NUM: ${{ github.event.issue.number }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_ACTION: ${{ github.event.action }}
+        run: |
+          if [ -z "$WEBHOOK_URL" ] || [ -z "$WEBHOOK_SECRET" ]; then
+            echo "Webhook secrets not configured, skipping."
+            exit 0
+          fi
+          BODY=$(printf '{"repo":"%s","issue":%s,"event":"%s","action":"%s"}' "$REPO" "$ISSUE_NUM" "$EVENT_NAME" "$EVENT_ACTION")
+          SIG=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" | sed 's/^.* //')
+          curl -fsS -X POST "$WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -H "X-Hub-Signature-256: sha256=${SIG}" \
+            -d "$BODY"
