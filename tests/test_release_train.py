@@ -913,8 +913,8 @@ class GitHubAdapterTest(unittest.TestCase):
 
     def test_gh_provider_parses_runs_variable_and_compare(self) -> None:
         responses = {
-            ("pr", "list", "--repo", REPO, "--base", "dev", "--state", "open", "--limit", "100", "--json", PR_FIELDS): [],
-            ("api", f"repos/{REPO}/actions/workflows/ci.yml/runs?branch=dev&per_page=20"): {
+            ("gh", "pr", "list", "--repo", REPO, "--base", "dev", "--state", "open", "--limit", "100", "--json", PR_FIELDS): [],
+            ("gh", "api", f"repos/{REPO}/actions/workflows/ci.yml/runs?branch=dev&per_page=20"): {
                 "workflow_runs": [
                     {
                         "name": "Проверка",
@@ -936,7 +936,7 @@ class GitHubAdapterTest(unittest.TestCase):
                     },
                 ]
             },
-            ("api", f"repos/{REPO}/compare/main...dev"): {
+            ("gh", "api", f"repos/{REPO}/compare/main...dev"): {
                 "ahead_by": 2,
                 "behind_by": 0,
                 "commits": [
@@ -946,6 +946,8 @@ class GitHubAdapterTest(unittest.TestCase):
             },
         }
 
+        seen: list[tuple[str, ...]] = []
+
         def runner(argv: Sequence[str]):
             class Done:
                 def __init__(self, text: str) -> None:
@@ -954,12 +956,14 @@ class GitHubAdapterTest(unittest.TestCase):
                     self.stderr = ""
 
             key = tuple(argv)
+            seen.append(key)
             return Done(json.dumps(responses.get(key, [])))
 
         provider = GhCliProvider(run=runner)
         ci = provider.branch_ci(REPO, "dev")
         compare = provider.compare(REPO, "main", "dev")
 
+        self.assertTrue(all(call[0] == "gh" for call in seen))
         self.assertEqual(ci.state, "pending")
         self.assertEqual(ci.latest_completed.commit_message, "feat: один (#55)")
         self.assertEqual(ci.latest_completed.pr_number, 55)
@@ -967,6 +971,23 @@ class GitHubAdapterTest(unittest.TestCase):
         self.assertEqual(compare.ahead_by, 2)
         self.assertEqual(compare.pull_requests, (55, 56))
         self.assertEqual(provider.open_prs(REPO, "dev"), ())
+
+    def test_gh_provider_wraps_timeout_and_os_error(self) -> None:
+        import subprocess as _sp
+
+        def raise_timeout(argv: Sequence[str]):
+            raise _sp.TimeoutExpired(argv, 30)
+
+        def raise_os_error(argv: Sequence[str]):
+            raise FileNotFoundError("gh not found")
+
+        with self.assertRaises(ProviderError) as ctx_t:
+            GhCliProvider(run=raise_timeout).open_prs(REPO, "dev")
+        self.assertIn("таймаут", str(ctx_t.exception))
+
+        with self.assertRaises(ProviderError) as ctx_o:
+            GhCliProvider(run=raise_os_error).automation_paused(REPO)
+        self.assertIn("gh not found", str(ctx_o.exception))
 
     def test_automation_pause_variable_is_fail_safe(self) -> None:
         class Done:
@@ -1024,9 +1045,9 @@ class GitHubAdapterTest(unittest.TestCase):
 
         def runner(argv: Sequence[str]):
             calls.append(tuple(argv))
-            if tuple(argv[:2]) == ("pr", "create"):
+            if tuple(argv[:3]) == ("gh", "pr", "create"):
                 return Done("https://github.com/rumap/rumap/pull/77\n")
-            if tuple(argv[:2]) == ("pr", "view"):
+            if tuple(argv[:3]) == ("gh", "pr", "view"):
                 return Done(json.dumps(item))
             return Done("[]")
 
@@ -1041,7 +1062,7 @@ class GitHubAdapterTest(unittest.TestCase):
 
         self.assertEqual(pr.number, 77)
         self.assertTrue(pr.has_label(RELEASE_TRAIN_LABEL))
-        create = next(call for call in calls if call[:2] == ("pr", "create"))
+        create = next(call for call in calls if call[:3] == ("gh", "pr", "create"))
         self.assertEqual(create[create.index("--label") + 1], RELEASE_TRAIN_LABEL)
 
 

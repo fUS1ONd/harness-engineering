@@ -64,7 +64,7 @@ class DeployTarget:
         ]
         if self.prune:
             steps.append((*self.docker, "image", "prune", "-f"))
-        return f"cd {self.directory} && " + " && ".join(shlex.join(step) for step in steps)
+        return f"cd {shlex.quote(self.directory)} && " + " && ".join(shlex.join(step) for step in steps)
 
     def to_dict(self) -> dict:
         return {
@@ -336,10 +336,8 @@ def _failed(
     layer: str,
     reason: str,
 ) -> DeployReport:
-    index = LAYER_ORDER.index(layer)
-    untouched = tuple(
-        target.node for target in plan if LAYER_ORDER.index(target.layer) > index
-    )
+    touched = {step.target for step in steps if step.stage == "deploy"}
+    untouched = tuple(target.node for target in plan if target.node not in touched)
     return DeployReport(
         ok=False,
         sha=sha,

@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
+import tempfile
 import time
 from pathlib import Path
 from typing import Protocol
@@ -43,7 +45,8 @@ class FileLockStore:
         self.pause_file = Path(pause_file) if pause_file else None
 
     def _lock_path(self, repo: str, key: str, sha: str) -> Path:
-        return self.directory / f"{_safe(repo)}__{_safe(key)}__{_safe(sha)[:12]}.lock"
+        digest = hashlib.sha256(sha.encode("utf-8")).hexdigest()[:16]
+        return self.directory / f"{_safe(repo)}__{_safe(key)}__{digest}.lock"
 
     def _ledger_path(self, repo: str) -> Path:
         return self.directory / f"deployed__{_safe(repo)}.json"
@@ -83,4 +86,14 @@ class FileLockStore:
         path = self._ledger_path(repo)
         path.parent.mkdir(parents=True, exist_ok=True)
         payload = {"repo": repo, "deployed_sha": sha, "recorded_at": int(time.time())}
-        path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        fd, tmp_name = tempfile.mkstemp(prefix=".deployed-", dir=path.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps(payload, ensure_ascii=False))
+            os.replace(tmp_name, path)
+        except BaseException:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise

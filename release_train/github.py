@@ -6,6 +6,7 @@ import json
 import re
 import subprocess
 from typing import Callable, Protocol, Sequence
+from urllib.parse import quote
 
 from .model import (
     BranchCi,
@@ -142,8 +143,8 @@ def to_pull_request(item: dict) -> PullRequest:
     )
 
 
-def _runner(argv: Sequence[str]) -> subprocess.CompletedProcess:
-    return subprocess.run(list(argv), text=True, capture_output=True)
+def _runner(argv: Sequence[str], timeout: float = 30.0) -> subprocess.CompletedProcess:
+    return subprocess.run(list(argv), text=True, capture_output=True, timeout=timeout)
 
 
 class GhCliProvider:
@@ -158,16 +159,30 @@ class GhCliProvider:
         run: Callable[[Sequence[str]], subprocess.CompletedProcess] | None = None,
         *,
         workflow_file: str = "ci.yml",
+        gh: str = "gh",
+        timeout: float = 30.0,
     ) -> None:
-        self._run = run or _runner
+        self.gh = gh
+        self.timeout = timeout
+        self._run = run or (lambda argv: _runner(argv, timeout=self.timeout))
         self.workflow_file = workflow_file
 
-    def _ok(self, argv: Sequence[str]) -> str:
-        done = self._run(argv)
+    def _exec(self, args: Sequence[str]) -> subprocess.CompletedProcess:
+        argv = [self.gh, *args]
+        command = args[0] if args else ""
+        try:
+            return self._run(argv)
+        except subprocess.TimeoutExpired as exc:
+            raise ProviderError(f"gh {command}: таймаут {self.timeout:g} с") from exc
+        except OSError as exc:
+            raise ProviderError(f"gh {command}: {exc}") from exc
+
+    def _ok(self, args: Sequence[str]) -> str:
+        done = self._exec(args)
         if done.returncode != 0:
             reason = (done.stderr or done.stdout or "").strip().splitlines()
             detail = reason[0] if reason else f"код {done.returncode}"
-            command = argv[1] if len(argv) > 1 else ""
+            command = args[0] if args else ""
             raise ProviderError(f"gh {command}: {detail}")
         return done.stdout
 
@@ -209,8 +224,8 @@ class GhCliProvider:
         data = self._json(
             [
                 "api",
-                f"repos/{repo}/actions/workflows/{self.workflow_file}/runs"
-                f"?branch={branch}&per_page=20",
+                f"repos/{repo}/actions/workflows/{quote(self.workflow_file, safe='')}/runs"
+                f"?branch={quote(branch, safe='')}&per_page=20",
             ]
         ) or {}
         runs = []
@@ -235,10 +250,14 @@ class GhCliProvider:
         return BranchCi(branch=branch, runs=tuple(runs))
 
     def branch_head(self, repo: str, branch: str) -> str:
-        return self._ok(["api", f"repos/{repo}/commits/{branch}", "--jq", ".sha"]).strip()
+        return self._ok(
+            ["api", f"repos/{repo}/commits/{quote(branch, safe='')}", "--jq", ".sha"]
+        ).strip()
 
     def compare(self, repo: str, base: str, head: str) -> Comparison:
-        data = self._json(["api", f"repos/{repo}/compare/{base}...{head}"]) or {}
+        data = self._json(
+            ["api", f"repos/{repo}/compare/{quote(base, safe='')}...{quote(head, safe='')}"]
+        ) or {}
         commits: list[str] = []
         pull_requests: list[int] = []
         for item in data.get("commits") or ():
@@ -258,7 +277,7 @@ class GhCliProvider:
         )
 
     def automation_paused(self, repo: str) -> bool:
-        done = self._run(["variable", "get", PAUSE_VARIABLE, "--repo", repo])
+        done = self._exec(["variable", "get", PAUSE_VARIABLE, "--repo", repo])
         if done.returncode != 0:
             reason = (done.stderr or "").lower()
             if "not found" in reason or "could not resolve" in reason:
@@ -277,6 +296,8 @@ class GhCliProvider:
         delete_branch: bool = False,
         method: str = "squash",
     ) -> None:
+        if method not in {"squash", "merge", "rebase"}:
+            raise ValueError(f"неподдерживаемый способ мерджа: {method}")
         argv = [
             "pr",
             "merge",
