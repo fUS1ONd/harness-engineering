@@ -11,8 +11,10 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
 
@@ -70,6 +72,7 @@ class FakeGitHub:
     def __init__(self) -> None:
         self.issues: dict[tuple[str, int], dict] = {}
         self.events: dict[tuple[str, int], list[dict]] = {}
+        self.event_pages: dict[tuple[str, int], list[list[dict]]] = {}
         self.mutations: list[dict] = []
         self.calls: list[list[str]] = []
         self.comment_error = False
@@ -185,7 +188,8 @@ class FakeGitHub:
         return self._ok({"ok": True})
 
     def _api(self, args: list[str]) -> subprocess.CompletedProcess:
-        endpoint = args[1]
+        slurp = "--slurp" in args
+        endpoint = next((a for a in args[1:] if not a.startswith("-")), "")
         parts = endpoint.split("?")[0].split("/")
         if (
             len(parts) >= 6
@@ -195,7 +199,10 @@ class FakeGitHub:
         ):
             repo = f"{parts[1]}/{parts[2]}"
             number = int(parts[4])
-            return self._ok(self.events.get((repo, number), []))
+            if slurp and (repo, number) in self.event_pages:
+                return self._ok(self.event_pages[(repo, number)])
+            payload = self.events.get((repo, number), [])
+            return self._ok([payload] if slurp else payload)
         return self._fail()
 
 
@@ -514,6 +521,42 @@ class IdempotencyTest(GateTestCase):
         self.assertEqual([item["issue"] for item in report["items"]], [7])
         self.assertFalse(any(call[1:2] == ["api"] for call in self.gh.calls))
 
+    def test_paginated_events_detect_relabel_on_later_page(self) -> None:
+        self.gh.add(
+            "rumap/rumap",
+            make_issue(
+                7,
+                labels=["bug", "status:needs-triage"],
+                comments=[make_comment(gate.MARKER, "2026-02-01T10:00:00Z")],
+            ),
+        )
+        self.gh.event_pages[("rumap/rumap", 7)] = [
+            [
+                {
+                    "event": "labeled",
+                    "label": {"name": "bug"},
+                    "created_at": "2026-01-15T10:00:00Z",
+                }
+            ],
+            [
+                {
+                    "event": "labeled",
+                    "label": {"name": "status:needs-triage"},
+                    "created_at": "2026-02-05T12:00:00Z",
+                }
+            ],
+        ]
+        _, report = self.scan()
+        self.assertEqual([item["issue"] for item in report["items"]], [7])
+        self.assertEqual(
+            report["items"][0]["retrigger_reason"],
+            "label:status:needs-triage@2026-02-05T12:00:00Z",
+        )
+        api_calls = [call for call in self.gh.calls if call[1:2] == ["api"]]
+        self.assertEqual(len(api_calls), 1)
+        self.assertIn("--paginate", api_calls[0])
+        self.assertIn("--slurp", api_calls[0])
+
 
 class LockTest(GateTestCase):
     def eligible_issue(self, number: int = 7) -> None:
@@ -581,6 +624,37 @@ class LockTest(GateTestCase):
         self.assertEqual([item["issue"] for item in report["items"]], [7])
         self.assertEqual(len(list(env_dir.glob("*.lock"))), 1)
 
+    def test_concurrent_acquire_lock_allows_only_one_winner(self) -> None:
+        workers = 8
+        barrier = threading.Barrier(workers)
+
+        def attempt() -> bool:
+            barrier.wait()
+            return gate.acquire_lock(self.lock_dir, "rumap/rumap", 7)
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            results = list(pool.map(lambda _: attempt(), range(workers)))
+        self.assertEqual(results.count(True), 1)
+        self.assertEqual(results.count(False), workers - 1)
+
+    def test_concurrent_expired_lock_takeover_allows_only_one_winner(self) -> None:
+        self.assertTrue(gate.acquire_lock(self.lock_dir, "rumap/rumap", 7))
+        lock_file = self.lock_files()[0]
+        expired = time.time() - gate.LOCK_TTL_SECONDS - 60
+        os.utime(lock_file, (expired, expired))
+
+        workers = 8
+        barrier = threading.Barrier(workers)
+
+        def attempt() -> bool:
+            barrier.wait()
+            return gate.acquire_lock(self.lock_dir, "rumap/rumap", 7)
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            results = list(pool.map(lambda _: attempt(), range(workers)))
+        self.assertEqual(results.count(True), 1)
+        self.assertEqual(results.count(False), workers - 1)
+
 
 class FixerSlotTest(GateTestCase):
     def add_fixer(self, repo: str, number: int) -> None:
@@ -610,6 +684,17 @@ class FixerSlotTest(GateTestCase):
         _, report = self.scan()
         self.assertEqual(report["active_fixers"], 1)
         self.assertTrue(report["auto_fix_slot_available"])
+
+    def test_active_fixers_counted_globally_when_scanning_single_repo(self) -> None:
+        self.gh.add("rumap/rumap", make_issue(7, labels=["bug"]))
+        self.add_fixer("rumap/rumap-android", 30)
+        self.add_fixer("rumap/rumap-core", 31)
+        _, report = self.scan(repos=("rumap/rumap",))
+        self.assertEqual(report["active_fixers"], 2)
+        self.assertEqual(report["max_fixers"], 2)
+        self.assertFalse(report["auto_fix_slot_available"])
+        self.assertEqual(report["items"][0]["active_fixers"], 2)
+        self.assertFalse(report["items"][0]["auto_fix_slot_available"])
 
     def test_cap_from_env(self) -> None:
         self.gh.add("rumap/rumap", make_issue(7, labels=["bug"]))

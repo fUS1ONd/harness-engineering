@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 import argparse
+import contextlib
+import fcntl
 import json
 import os
 import re
@@ -56,14 +58,21 @@ def gh_json(args: list[str]) -> dict | list:
     return json.loads(res.stdout)
 
 
-def gh_api_optional(endpoint: str) -> dict | list | None:
-    res = run(["gh", "api", endpoint], check=False)
+def gh_api_optional(endpoint: str, *, paginate: bool = False) -> dict | list | None:
+    cmd = ["gh", "api"]
+    if paginate:
+        cmd.extend(["--paginate", "--slurp"])
+    cmd.append(endpoint)
+    res = run(cmd, check=False)
     if res.returncode != 0 or not res.stdout.strip():
         return None
     try:
-        return json.loads(res.stdout)
+        data = json.loads(res.stdout)
     except json.JSONDecodeError:
         return None
+    if paginate and isinstance(data, list) and data and all(isinstance(page, list) for page in data):
+        return [item for page in data for item in page]
+    return data
 
 
 def resolve_lock_dir(cli_value: str | None = None) -> Path:
@@ -144,8 +153,8 @@ def normalize_issue(raw: dict) -> dict:
     }
 
 
-def fetch_issue(repo: str, number: int) -> dict:
-    raw = gh_json([
+def fetch_issue_raw(repo: str, number: int) -> dict:
+    return gh_json([
         "issue",
         "view",
         str(number),
@@ -154,7 +163,10 @@ def fetch_issue(repo: str, number: int) -> dict:
         "--json",
         "number,title,url,state,author,body,labels,assignees,comments",
     ])
-    return normalize_issue(raw)
+
+
+def fetch_issue(repo: str, number: int) -> dict:
+    return normalize_issue(fetch_issue_raw(repo, number))
 
 
 def stop_reason(issue: dict) -> str | None:
@@ -198,7 +210,10 @@ def comment_retrigger(issue: dict, since_ts: str | None) -> dict | None:
 def label_retrigger(repo: str, issue: dict, since_ts: str | None) -> dict | None:
     if NEEDS_TRIAGE_LABEL not in issue["labels"]:
         return None
-    events = gh_api_optional(f"repos/{repo}/issues/{issue['number']}/events?per_page=100")
+    events = gh_api_optional(
+        f"repos/{repo}/issues/{issue['number']}/events?per_page=100",
+        paginate=True,
+    )
     if not isinstance(events, list):
         return None
     latest: str | None = None
@@ -309,35 +324,70 @@ def lock_path_for(lock_dir: Path | str, repo: str, issue_number: int) -> Path:
     return Path(lock_dir) / f"{safe_repo}__issue{issue_number}.lock"
 
 
+def _lock_guard_path_for(lock_dir: Path | str, repo: str, issue_number: int) -> Path:
+    safe_repo = repo.replace("/", "__")
+    return Path(lock_dir) / f"{safe_repo}__issue{issue_number}.guard"
+
+
+@contextlib.contextmanager
+def _lock_guard(lock_dir: Path | str, repo: str, issue_number: int):
+    Path(lock_dir).mkdir(parents=True, exist_ok=True)
+    guard_path = _lock_guard_path_for(lock_dir, repo, issue_number)
+    fd = os.open(guard_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
 def is_locked(lock_dir: Path | str, repo: str, issue_number: int) -> bool:
     path = lock_path_for(lock_dir, repo, issue_number)
-    if not path.exists():
+    try:
+        st = path.stat()
+    except FileNotFoundError:
         return False
-    age = time.time() - path.stat().st_mtime
-    if age > LOCK_TTL_SECONDS:
-        try:
-            path.unlink()
-        except OSError:
-            pass
-        return False
-    return True
+    return (time.time() - st.st_mtime) <= LOCK_TTL_SECONDS
 
 
 def acquire_lock(lock_dir: Path | str, repo: str, issue_number: int) -> bool:
-    Path(lock_dir).mkdir(parents=True, exist_ok=True)
-    if is_locked(lock_dir, repo, issue_number):
-        return False
     path = lock_path_for(lock_dir, repo, issue_number)
-    path.write_text(f"{os.getpid()} {int(time.time())}\n", encoding="utf-8")
-    return True
+    with _lock_guard(lock_dir, repo, issue_number):
+        now = time.time()
+        try:
+            st = path.stat()
+        except FileNotFoundError:
+            st = None
+        if st is not None:
+            if (now - st.st_mtime) <= LOCK_TTL_SECONDS:
+                return False
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            return False
+        try:
+            os.write(fd, f"{os.getpid()} {int(now)}\n".encode("utf-8"))
+        finally:
+            os.close(fd)
+        return True
 
 
 def release_lock(lock_dir: Path | str, repo: str, issue_number: int) -> None:
+    if not Path(lock_dir).exists():
+        return
     path = lock_path_for(lock_dir, repo, issue_number)
-    try:
-        path.unlink()
-    except OSError:
-        pass
+    with _lock_guard(lock_dir, repo, issue_number):
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def count_active_fixers(repos: list[str]) -> int:
@@ -415,15 +465,7 @@ def inspect_issue(
     take_lock: bool = False,
     lock_dir: Path | str = LOCK_DIR,
 ) -> dict:
-    raw = gh_json([
-        "issue",
-        "view",
-        str(number),
-        "--repo",
-        repo,
-        "--json",
-        "number,title,url,state,author,body,labels,assignees,comments",
-    ])
+    raw = fetch_issue_raw(repo, number)
     return evaluate_issue(repo, raw, take_lock=take_lock, lock_dir=lock_dir)
 
 
@@ -472,12 +514,9 @@ def cmd_scan(args: argparse.Namespace) -> int:
         return emit_error(error)
 
     lock_dir = resolve_lock_dir(args.lock_dir)
-    try:
-        max_fixers = resolve_max_fixers(args.max_fixers)
-    except ValueError as exc:
-        return emit_error(str(exc))
+    max_fixers = resolve_max_fixers(args.max_fixers)
 
-    active_fixers = count_active_fixers(repos)
+    active_fixers = count_active_fixers(list(LOCAL_REPOS.keys()))
 
     items: list[dict] = []
     skipped: list[dict] = []
@@ -509,10 +548,7 @@ def cmd_inspect(args: argparse.Namespace) -> int:
     if args.repo not in LOCAL_REPOS:
         return emit_error(f"unknown_repo:{args.repo}")
     lock_dir = resolve_lock_dir(args.lock_dir)
-    try:
-        max_fixers = resolve_max_fixers(args.max_fixers)
-    except ValueError as exc:
-        return emit_error(str(exc))
+    max_fixers = resolve_max_fixers(args.max_fixers)
 
     info = inspect_issue(
         args.repo,
@@ -550,9 +586,6 @@ def cmd_act(args: argparse.Namespace) -> int:
             areas.append(area)
     if not areas:
         return emit_error("area_label_required")
-
-    if args.status not in TARGET_STATUS_LABELS:
-        return emit_error(f"unknown_status_label:{args.status}")
 
     if not args.body_file or not Path(args.body_file).is_file():
         return emit_error(f"body_file_not_found:{args.body_file}")
