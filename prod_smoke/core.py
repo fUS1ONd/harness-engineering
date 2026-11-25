@@ -14,6 +14,7 @@ from .transport import HttpResult, Transport
 
 ROLE_ORDER = ("center", "worker", "point")
 LOG_PATTERN = re.compile(r"(?i)\b(?:error|panic|fatal)\b")
+ERROR_LOG_LEVELS = frozenset({"ERROR", "FATAL", "PANIC"})
 MAX_EVIDENCE_LINES = 5
 MAX_EVIDENCE_CHARS = 500
 
@@ -355,7 +356,7 @@ def _log_check(
     text = done.stdout
     if done.stderr:
         text = text + ("" if not text or text.endswith("\n") else "\n") + done.stderr
-    matches = [line for line in text.splitlines() if LOG_PATTERN.search(line)]
+    matches = [line for line in text.splitlines() if _is_error_log_line(line)]
     window = _fmt_window(window_seconds)
     if not matches:
         return _pass("logs", container, f"ERROR/PANIC/fatal за {window} нет")
@@ -367,6 +368,21 @@ def _log_check(
         detail=f"{len(matches)} совпадений ERROR/PANIC/fatal за {window}",
         evidence=evidence,
     )
+
+
+def _is_error_log_line(line: str) -> bool:
+    stripped = line.strip()
+    if stripped.startswith("{") and stripped.endswith("}"):
+        try:
+            parsed = json.loads(stripped)
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, dict):
+            level = parsed.get("level")
+            if isinstance(level, str) and level.strip():
+                normalized = level.strip().upper().split("+", 1)[0]
+                return normalized in ERROR_LOG_LEVELS
+    return bool(LOG_PATTERN.search(line))
 
 
 def _metric_value(body: str, series: str) -> float | None:

@@ -2,7 +2,7 @@
 
 Конвейер автоматически проводит выбранные PR в `rumap/rumap` от мерджа в `dev` до зелёного `main CI`, а после явного подтверждения владельца выполняет поэтапную выкатку на прод с проверкой каждого слоя:
 
-`PR с меткой release-train → dev CI → батчинг в release PR dev → main → main CI → ручное подтверждение «деплой» → center → prod-smoke → worker → prod-smoke → point → prod-smoke`
+`PR с меткой release-train → dev CI → батчинг в release PR dev → main → main CI → ручное подтверждение «деплой» → point → prod-smoke → worker → prod-smoke → center → prod-smoke`
 
 В работу попадают только PR с явной opt-in меткой `release-train`. Остальные PR живут в обычном режиме.
 
@@ -11,25 +11,25 @@
 - **Стейт-машина `release-train`:** [scripts/release-train.py](../scripts/release-train.py)
   - `scan` — собирает снимок состояния GitHub и локальных замков (открытые PR, `dev CI`, release PR `dev → main`, `main CI`, стоп-краны, последний выкаченный `sha`) и печатает рекомендуемое действие.
   - `step` — выполняет ровно один разрешённый переход с идемпотентным замком в `~/.cache/release-train` (переопределяется через `RELEASE_TRAIN_STATE_DIR` или `--state-dir`). Повторные webhook-события для уже отработанного `(repo, key, sha)` завершаются как `noop`.
-  - `deploy` — сверяет стоп-краны и подтверждённый `--sha` с текущим `HEAD` ветки `main`, затем поэтапно выкатывает слои `center → worker → point` с запуском `prod-smoke` после каждого слоя и фиксирует выкаченный `sha`.
+  - `deploy` — сверяет стоп-краны, подтверждённый `--sha` и зелёный `main CI` для этого `sha`, затем поэтапно выкатывает слои `point → worker → center` с warmup-повторами `prod-smoke` после каждого слоя (`docker image prune -f` на центре — только после зелёного `prod-smoke`) и фиксирует выкаченный `sha`.
 - **Прод-верификация `prod-smoke`:** [scripts/prod-smoke.py](../scripts/prod-smoke.py)
-  - Read-only CLI для проверки слоёв `center`, `worker`, `point` или `all`: статус контейнеров / `systemd`-юнитов без рестартов за окно наблюдения, health-эндпоинты, отсутствие `ERROR` / `PANIC` / `fatal` в логах, живой heartbeat / метрики.
+  - Read-only CLI для проверки слоёв `center`, `worker`, `point` или `all`: статус контейнеров / `systemd`-юнитов без рестартов за окно наблюдения, health-эндпоинты, отсутствие `ERROR` / `PANIC` / `fatal` в логах (для JSON `slog` — по явному полю `level`), живой heartbeat / метрики.
 - **T3 Code webhook-задача:** `Release Train (rumap)` (`freshSession: true`, HMAC-подпись `X-Hub-Signature-256: sha256=<hex>`, дедупликация по ключу `{{body.repo}}#{{body.ref}}` в окне `15` с).
-- **GitHub Actions триггер:** `.github/workflows/release-train-trigger.yml` в `rumap/rumap` (присутствует в обеих ветках `main` и `dev`).
-  - Реагирует на `pull_request_target` (`[labeled, synchronize, reopened, ready_for_review]`) для не-draft PR в `dev` или release PR `dev → main` с меткой `release-train` и без `hold`.
+- **GitHub Actions триггер:** `.github/workflows/release-train-trigger.yml` в `rumap/rumap` (присутствует в обеих ветках `main` и `dev`, с явным `permissions: {}`).
+  - Реагирует на `pull_request_target` (`[labeled, unlabeled, synchronize, reopened, ready_for_review]`) и `pull_request_review` (`[submitted, dismissed]`) для не-draft PR в `dev` или release PR `dev → main` с меткой `release-train` и без `hold`.
   - Реагирует на `workflow_run` для workflow `Проверка` (`[completed]`, кроме `cancelled`) на ветках `dev`, `main` и на PR.
 
 ## Поведение тредов T3 Code
 
 Webhook-задача запускает короткий одноразовый тред (`freshSession: true`) и действует строго по полю `thread_action` из вывода `scripts/release-train.py`:
 
-- **Промежуточный шаг, `noop` или `paused` (`settle`):** выполнен один переход (мердж PR в `dev`, открытие/обновление/мердж release PR), нечего делать или активен стоп-кран → тред сразу закрывается через `t3_thread_organize(action="settle")`.
-- **Красный CI (`ci_failed` → `settle`):** при падении CI на PR, release PR, `dev` или `main` скрипт постит комментарий в соответствующий PR со ссылкой на упавший прогон и списком проверок, после чего тред закрывается (`settle`). Повторные уведомления для того же `sha` отсекаются замком.
+- **Промежуточный шаг, `noop` или `paused` (`settle`):** выполнен один переход (мердж PR в `dev`, открытие или мердж release PR с обновлением описания), нечего делать или активен стоп-кран → тред сразу закрывается через `t3_thread_organize(action="settle")`.
+- **Красный CI (`ci_failed` → `settle` или `alert_open`):** при падении CI на PR, release PR, `dev` или `main` скрипт находит целевой PR (включая post-merge поиск через `commits/{sha}/pulls` и сообщение коммита), постит комментарий со ссылкой на упавший прогон и закрывает тред (`settle`). Если целевой PR найти не удалось — тред остаётся открытым (`alert_open`) без постановки бессрочного замка.
 - **Зелёный `main CI` (`ready_to_deploy` → `wait_deploy`):** когда `dev` синхронизирован с `main`, `main CI` зелёный для текущего `main_sha` и этот `sha` ещё не выкачен, тред публикует в чат сводку коммитов/PR и **не сеттлится** (`idle`), ожидая явной команды владельца `деплой`.
 - **Выкатка после `деплой`:**
   - Запускается `scripts/release-train.py deploy --sha <main_sha>`.
-  - Если все 3 слоя (`center → worker → point`) выкачены и `prod-smoke` зелёный → публикуется итоговый отчёт и тред закрывается (`settle`).
-  - Если `main` успел уйти вперёд (`sha_moved`), упал `docker compose` или провалился `prod-smoke` на любом слое → **жёсткий fail-fast без авто-отката**: следующие слои и узлы не трогаются, тред остаётся открытым (`alert_open`) с диагностикой и фрагментами логов для решения владельца.
+  - Если все 3 слоя (`point → worker → center`) выкачены и `prod-smoke` зелёный → публикуется итоговый отчёт и тред закрывается (`settle`).
+  - Если `main` успел уйти вперёд (`sha_moved`), `main CI` не зелёный (`ci_not_ready`), упал `docker compose` или провалился `prod-smoke` на любом слое → **жёсткий fail-fast без авто-отката**: следующие слои и узлы не трогаются, тред остаётся открытым (`alert_open`) с диагностикой и фрагментами логов для решения владельца.
 
 ## Батчинг `dev → main`
 
@@ -68,7 +68,7 @@ python3 /root/harness-engineering/scripts/release-train.py scan --format text
 # Выполнить ровно один разрешённый переход
 python3 /root/harness-engineering/scripts/release-train.py step --repo rumap/rumap --format both
 
-# Поэтапная выкатка подтверждённого коммита main (center → worker → point)
+# Поэтапная выкатка подтверждённого коммита main (point → worker → center)
 python3 /root/harness-engineering/scripts/release-train.py deploy --sha <main_sha> --format both
 
 # Отдельная read-only проверка здоровья текущего прода

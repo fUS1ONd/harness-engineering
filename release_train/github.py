@@ -22,11 +22,13 @@ PR_FIELDS = (
     "mergeable,statusCheckRollup,reviews,author,body"
 )
 PAUSE_VARIABLE = "RELEASE_TRAIN_PAUSED"
+WORKFLOW_NAME = "Проверка"
 PENDING_STATES = frozenset({"QUEUED", "IN_PROGRESS", "PENDING", "WAITING", "EXPECTED"})
 FAILED_CONCLUSIONS = frozenset({"FAILURE", "TIMED_OUT", "ACTION_REQUIRED", "ERROR", "STARTUP_FAILURE"})
 SKIPPED_CONCLUSIONS = frozenset({"SKIPPED", "NEUTRAL", "CANCELLED"})
 RESUME_VALUES = frozenset({"", "0", "false", "no", "off"})
 PR_NUMBER_RE = re.compile(r"\(#(\d+)\)\s*$")
+MERGE_PR_RE = re.compile(r"^Merge pull request #(\d+)\b")
 PR_URL_RE = re.compile(r"/pull/(\d+)")
 
 
@@ -42,6 +44,8 @@ class GitHubProvider(Protocol):
     def branch_ci(self, repo: str, branch: str) -> BranchCi: ...
 
     def branch_head(self, repo: str, branch: str) -> str: ...
+
+    def commit_pr(self, repo: str, sha: str) -> int | None: ...
 
     def compare(self, repo: str, base: str, head: str) -> Comparison: ...
 
@@ -73,13 +77,49 @@ class GitHubProvider(Protocol):
     def comment_pr(self, repo: str, number: int, body: str) -> None: ...
 
 
-def summarize_checks(rollup: Sequence[dict] | None) -> CheckSummary:
-    """Сводит `statusCheckRollup` к одному состоянию и списку упавших проверок."""
+def extract_pr_number(message: str | None) -> int | None:
+    """Извлекает номер PR из заголовка merge- или squash-коммита."""
+    text = (message or "").strip()
+    if not text:
+        return None
+    subject = text.splitlines()[0]
+    match = MERGE_PR_RE.search(subject) or PR_NUMBER_RE.search(subject)
+    return int(match.group(1)) if match else None
+
+
+def _check_rank(item: dict, index: int) -> tuple[int, str, str, str, int]:
+    completed = item.get("completedAt") or ""
+    started = item.get("startedAt") or ""
+    latest = completed if completed >= started else started
+    status = (item.get("status") or "").upper()
+    conclusion = (item.get("conclusion") or item.get("state") or "").upper()
+    unstarted_pending = 1 if (not latest and (status in PENDING_STATES or conclusion in PENDING_STATES)) else 0
+    return (unstarted_pending, latest, completed, started, index)
+
+
+def summarize_checks(
+    rollup: Sequence[dict] | None,
+    *,
+    workflow_name: str | None = WORKFLOW_NAME,
+) -> CheckSummary:
+    """Сводит `statusCheckRollup` рабочего workflow к одному состоянию с дедупликацией перезапусков."""
+    latest_by_key: dict[tuple[str, str], tuple[tuple[int, str, str, str, int], dict]] = {}
+    for index, item in enumerate(rollup or ()):
+        item_workflow = item.get("workflowName") or ""
+        if workflow_name is not None and item_workflow != workflow_name:
+            continue
+        name = item.get("name") or item.get("context") or "unknown"
+        key = (item_workflow, name)
+        rank = _check_rank(item, index)
+        previous = latest_by_key.get(key)
+        if previous is None or rank >= previous[0]:
+            latest_by_key[key] = (rank, item)
+
     pending: list[CheckRef] = []
     failed: list[CheckRef] = []
     passed = 0
     skipped = 0
-    for item in rollup or ():
+    for _, item in latest_by_key.values():
         name = item.get("name") or item.get("context") or "unknown"
         url = item.get("detailsUrl") or item.get("targetUrl") or ""
         status = (item.get("status") or "").upper()
@@ -121,7 +161,7 @@ def has_other_changes_requested(reviews: Sequence[dict] | None) -> bool:
     return any(state == "CHANGES_REQUESTED" for state in latest.values())
 
 
-def to_pull_request(item: dict) -> PullRequest:
+def to_pull_request(item: dict, *, workflow_name: str | None = WORKFLOW_NAME) -> PullRequest:
     labels = tuple(
         label.get("name", "") if isinstance(label, dict) else str(label)
         for label in (item.get("labels") or ())
@@ -137,7 +177,7 @@ def to_pull_request(item: dict) -> PullRequest:
         labels=labels,
         is_draft=bool(item.get("isDraft")),
         mergeable=(item.get("mergeable") or "UNKNOWN").upper(),
-        checks=summarize_checks(item.get("statusCheckRollup")),
+        checks=summarize_checks(item.get("statusCheckRollup"), workflow_name=workflow_name),
         changes_requested=has_other_changes_requested(item.get("reviews")),
         body=item.get("body") or "",
     )
@@ -159,6 +199,7 @@ class GhCliProvider:
         run: Callable[[Sequence[str]], subprocess.CompletedProcess] | None = None,
         *,
         workflow_file: str = "ci.yml",
+        workflow_name: str | None = WORKFLOW_NAME,
         gh: str = "gh",
         timeout: float = 30.0,
     ) -> None:
@@ -166,6 +207,7 @@ class GhCliProvider:
         self.timeout = timeout
         self._run = run or (lambda argv: _runner(argv, timeout=self.timeout))
         self.workflow_file = workflow_file
+        self.workflow_name = workflow_name
 
     def _exec(self, args: Sequence[str]) -> subprocess.CompletedProcess:
         argv = [self.gh, *args]
@@ -212,10 +254,29 @@ class GhCliProvider:
                 PR_FIELDS,
             ]
         )
-        return tuple(to_pull_request(item) for item in data or ())
+        return tuple(to_pull_request(item, workflow_name=self.workflow_name) for item in data or ())
 
     def release_pr(self, repo: str, base: str = "main", head: str = "dev") -> PullRequest | None:
-        for pr in self.open_prs(repo, base):
+        data = self._json(
+            [
+                "pr",
+                "list",
+                "--repo",
+                repo,
+                "--base",
+                base,
+                "--head",
+                head,
+                "--state",
+                "open",
+                "--limit",
+                "1",
+                "--json",
+                PR_FIELDS,
+            ]
+        )
+        for item in data or ():
+            pr = to_pull_request(item, workflow_name=self.workflow_name)
             if pr.head_ref == head:
                 return pr
         return None
@@ -225,7 +286,7 @@ class GhCliProvider:
             [
                 "api",
                 f"repos/{repo}/actions/workflows/{quote(self.workflow_file, safe='')}/runs"
-                f"?branch={quote(branch, safe='')}&per_page=20",
+                f"?branch={quote(branch, safe='')}&event=push&per_page=20",
             ]
         ) or {}
         runs = []
@@ -253,6 +314,18 @@ class GhCliProvider:
         return self._ok(
             ["api", f"repos/{repo}/commits/{quote(branch, safe='')}", "--jq", ".sha"]
         ).strip()
+
+    def commit_pr(self, repo: str, sha: str) -> int | None:
+        if not sha:
+            return None
+        data = self._json(
+            ["api", f"repos/{repo}/commits/{quote(sha, safe='')}/pulls?per_page=5"]
+        )
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict) and item.get("number") is not None:
+                    return int(item["number"])
+        return None
 
     def compare(self, repo: str, base: str, head: str) -> Comparison:
         data = self._json(
@@ -344,7 +417,7 @@ class GhCliProvider:
             number = int(match.group(1))
             data = self._json(["pr", "view", str(number), "--repo", repo, "--json", PR_FIELDS])
             if data:
-                return to_pull_request(data)
+                return to_pull_request(data, workflow_name=self.workflow_name)
         created = self.release_pr(repo, base=base, head=head)
         if created is None:
             raise ProviderError("release PR создан, но не найден в списке открытых")

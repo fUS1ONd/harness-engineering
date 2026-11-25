@@ -2,10 +2,19 @@
 
 from __future__ import annotations
 
+import time
+from dataclasses import replace
 from typing import Callable, Sequence
 
-from .deploy import DeployProvider, DeployReport, DeployTarget, run_deploy
-from .github import GitHubProvider
+from .deploy import (
+    DEFAULT_SMOKE_ATTEMPTS,
+    DEFAULT_SMOKE_INTERVAL_SECONDS,
+    DeployProvider,
+    DeployReport,
+    DeployTarget,
+    run_deploy,
+)
+from .github import GitHubProvider, extract_pr_number
 from .locks import LockStore
 from .model import (
     ALERT_OPEN,
@@ -13,6 +22,7 @@ from .model import (
     RELEASE_TRAIN_LABEL,
     SETTLE,
     WAIT_DEPLOY,
+    BranchCi,
     CheckRef,
     CiRun,
     Decision,
@@ -24,6 +34,28 @@ BASE_BRANCH = "main"
 HEAD_BRANCH = "dev"
 RELEASE_PR_TITLE = "release-train: dev → main"
 BODY_MARKER = "<!-- release-train:head:{} -->"
+
+
+def _resolve_failed_run_pr(
+    provider: GitHubProvider,
+    repo: str,
+    branch_ci: BranchCi,
+    sha: str,
+) -> BranchCi:
+    """Добирает номер PR упавшего post-merge прогона через GitHub API или сообщение коммита."""
+    failed = branch_ci.failed_run(sha)
+    if failed is None or failed.pr_number is not None:
+        return branch_ci
+    pr_number = provider.commit_pr(repo, failed.sha) if failed.sha else None
+    if pr_number is None:
+        pr_number = extract_pr_number(failed.commit_message)
+    if pr_number is None:
+        return branch_ci
+    updated = tuple(
+        replace(run, pr_number=pr_number) if run is failed else run
+        for run in branch_ci.runs
+    )
+    return replace(branch_ci, runs=updated)
 
 
 def collect_state(
@@ -41,14 +73,16 @@ def collect_state(
     deploy_compare = None
     if deployed_sha and deployed_sha != main_sha:
         deploy_compare = provider.compare(repo, deployed_sha, main_sha)
+    dev_ci = _resolve_failed_run_pr(provider, repo, provider.branch_ci(repo, head), dev_sha)
+    main_ci = _resolve_failed_run_pr(provider, repo, provider.branch_ci(repo, base), main_sha)
     return TrainState(
         repo=repo,
         main_sha=main_sha,
         dev_sha=dev_sha,
         dev_prs=provider.open_prs(repo, head),
         release_pr=provider.release_pr(repo, base=base, head=head),
-        dev_ci=provider.branch_ci(repo, head),
-        main_ci=provider.branch_ci(repo, base),
+        dev_ci=dev_ci,
+        main_ci=main_ci,
         compare=provider.compare(repo, base, head),
         deploy_compare=deploy_compare,
         paused_repo=provider.automation_paused(repo),
@@ -159,19 +193,44 @@ def _branch_ci_failure(
         if run is None:
             continue
         marker_sha = run.sha or run.url
+        resolved_pr = (
+            run.pr_number if run.pr_number is not None else extract_pr_number(run.commit_message)
+        )
+        if branch == state.head_branch:
+            target = state.release_pr.number if state.release_pr else resolved_pr
+        else:
+            target = resolved_pr
+        scope = f"CI ветки `{branch}`"
+        names = run.workflow or "workflow"
+        if target is None:
+            return Decision(
+                action="ci_failed",
+                thread_action=ALERT_OPEN,
+                summary=(
+                    f"Красный {scope}: {names}, целевой PR не найден. "
+                    f"Прогон: {run.url or '—'}. Тред оставляю открытым для владельца."
+                ),
+                details={
+                    "scope": scope,
+                    "failed": [{"name": names, "url": run.url}],
+                    "sha": run.sha,
+                    "branch": branch,
+                },
+                run=run,
+                comment_target=None,
+                comment_body="",
+                lock_key=None,
+                lock_sha="",
+            )
         key = f"comment:branch:{branch}"
         if handled_comment is not None and handled_comment(key, marker_sha):
             continue
-        scope = f"CI ветки `{branch}`"
-        target = state.release_pr.number if state.release_pr else run.pr_number
-        names = run.workflow or "workflow"
         return Decision(
             action="ci_failed",
             thread_action=SETTLE,
             summary=(
-                f"Красный {scope}: {names}"
-                + (f", PR #{target}" if target else "")
-                + f". Прогон: {run.url or '—'}. Тред закрываю."
+                f"Красный {scope}: {names}, PR #{target}. "
+                f"Прогон: {run.url or '—'}. Тред закрываю."
             ),
             details={
                 "scope": scope,
@@ -281,19 +340,8 @@ def _promotion(
         return _noop(f"У release PR #{pr.number} нет зелёного CI.", {"pull_request": pr.to_dict()})
     if pr.mergeable != "MERGEABLE":
         return _noop(f"Release PR #{pr.number} пока {pr.mergeable}.", {"pull_request": pr.to_dict()})
-    if BODY_MARKER.format(state.dev_sha) not in pr.body:
-        return Decision(
-            action="updated_release_pr",
-            thread_action=SETTLE,
-            summary=(
-                f"Обновляю описание release PR #{pr.number} под батч из "
-                f"{state.compare.ahead_by} коммит(ов)."
-            ),
-            details=dict(batch),
-            pr=pr,
-            lock_key="release-pr:update",
-            lock_sha=state.dev_sha,
-        )
+    merge_details = dict(batch)
+    merge_details["body_updated"] = BODY_MARKER.format(state.dev_sha) not in pr.body
     return Decision(
         action="merged_release_pr",
         thread_action=SETTLE,
@@ -301,7 +349,7 @@ def _promotion(
             f"Вливаю release PR #{pr.number} в `{state.base_branch}`: "
             f"{state.compare.ahead_by} коммит(ов), PR: {_pr_list(state.compare.pull_requests)}."
         ),
-        details=dict(batch),
+        details=merge_details,
         pr=pr,
         lock_key="release-pr:merge",
         lock_sha=pr.head_sha,
@@ -440,9 +488,9 @@ def _apply(decision: Decision, provider: GitHubProvider, state: TrainState) -> N
             body=release_pr_body(state),
             labels=(RELEASE_TRAIN_LABEL,),
         )
-    elif decision.action == "updated_release_pr":
-        provider.update_release_pr(repo, decision.pr.number, body=release_pr_body(state))
     elif decision.action == "merged_release_pr":
+        if BODY_MARKER.format(state.dev_sha) not in decision.pr.body:
+            provider.update_release_pr(repo, decision.pr.number, body=release_pr_body(state))
         # `dev → main` вливается merge-коммитом: squash развёл бы истории и `main...dev`
         # навсегда показывал бы «впереди», гоняя пустые релизы по кругу.
         provider.merge_pr(repo, decision.pr.number, decision.pr.head_sha, method="merge")
@@ -462,8 +510,11 @@ def deploy_train(
     base: str = BASE_BRANCH,
     expected_sha: str | None = None,
     targets: Sequence[DeployTarget] | None = None,
+    smoke_attempts: int = DEFAULT_SMOKE_ATTEMPTS,
+    smoke_interval: float = DEFAULT_SMOKE_INTERVAL_SECONDS,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> DeployReport:
-    """Стоп-кран, сверка подтверждённого sha и поэтапная выкатка с журналом."""
+    """Стоп-кран, сверка подтверждённого sha и зелёного main CI, поэтапная выкатка."""
     if locks.paused() or provider.automation_paused(repo):
         source = "pause_file" if locks.paused() else "repo_variable:RELEASE_TRAIN_PAUSED"
         return DeployReport(ok=False, action="paused", thread_action=SETTLE, reason=source)
@@ -481,7 +532,44 @@ def deploy_train(
             ),
         )
 
-    report = run_deploy(sha, deployer, targets=targets)
+    main_ci = provider.branch_ci(repo, base)
+    if main_ci.state == "pending":
+        active = ", ".join(run.workflow or "CI" for run in main_ci.active) or "CI"
+        return DeployReport(
+            ok=False,
+            sha=sha,
+            action="ci_not_ready",
+            thread_action=ALERT_OPEN,
+            reason=f"CI на `{base}` ещё идёт ({active}) — выкатывать до зелёного прогона не буду",
+        )
+    latest = main_ci.latest_completed
+    if main_ci.state != "passed" or latest is None or latest.sha != sha:
+        if main_ci.state == "passed" and latest is not None and latest.sha:
+            reason = (
+                f"зелёный CI на `{base}` относится к {short_sha(latest.sha)}, "
+                f"а не к {short_sha(sha)} — выкатывать не буду"
+            )
+        else:
+            reason = (
+                f"CI на `{base}` для {short_sha(sha)} не зелёный ({main_ci.state}) — "
+                "выкатывать не буду"
+            )
+        return DeployReport(
+            ok=False,
+            sha=sha,
+            action="ci_not_ready",
+            thread_action=ALERT_OPEN,
+            reason=reason,
+        )
+
+    report = run_deploy(
+        sha,
+        deployer,
+        targets=targets,
+        smoke_attempts=smoke_attempts,
+        smoke_interval=smoke_interval,
+        sleep=sleep,
+    )
     if report.ok:
         locks.mark_deployed(repo, sha)
     return report

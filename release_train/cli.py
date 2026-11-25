@@ -11,7 +11,13 @@ from typing import Sequence, TextIO
 
 from prod_smoke.cli import parse_window
 
-from .deploy import DeployProvider, SshDeployProvider, render_deploy_text
+from .deploy import (
+    DEFAULT_SMOKE_ATTEMPTS,
+    DEFAULT_SMOKE_INTERVAL_SECONDS,
+    DeployProvider,
+    SshDeployProvider,
+    render_deploy_text,
+)
 from .engine import (
     BASE_BRANCH,
     HEAD_BRANCH,
@@ -67,7 +73,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("scan", parents=[common], help="собрать состояние поезда и рекомендацию")
     sub.add_parser("step", parents=[common], help="выполнить ровно один разрешённый переход")
-    p_deploy = sub.add_parser("deploy", parents=[common], help="выкатить слои center → worker → point")
+    p_deploy = sub.add_parser("deploy", parents=[common], help="выкатить слои point → worker → center")
     p_deploy.add_argument(
         "--sha",
         default=None,
@@ -79,6 +85,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=300,
         metavar="ОКНО",
         help="окно наблюдения prod-smoke после слоя: 300, 90s, 5m (по умолчанию 5m)",
+    )
+    p_deploy.add_argument(
+        "--smoke-attempts",
+        type=int,
+        default=DEFAULT_SMOKE_ATTEMPTS,
+        help=f"число попыток prod-smoke после слоя (по умолчанию {DEFAULT_SMOKE_ATTEMPTS})",
+    )
+    p_deploy.add_argument(
+        "--smoke-interval",
+        type=float,
+        default=DEFAULT_SMOKE_INTERVAL_SECONDS,
+        help=f"пауза в секундах между попытками prod-smoke (по умолчанию {DEFAULT_SMOKE_INTERVAL_SECONDS:g})",
     )
     return parser
 
@@ -175,6 +193,8 @@ def _dispatch(
         args.repo,
         base=args.base,
         expected_sha=args.sha,
+        smoke_attempts=args.smoke_attempts,
+        smoke_interval=args.smoke_interval,
     )
     text = render_deploy_text(report)
     payload = {

@@ -230,13 +230,50 @@ class LogScanTest(unittest.TestCase):
         fake.logs[("rumap-center", "rumap-center-rumap-center-1")] = ExecResult(
             ("docker", "logs"),
             0,
-            '{"level":"WARN","msg":"сводка об AS не записана","ошибка":"HTTP 504"}\n',
+            "\n".join(
+                [
+                    '{"level":"DEBUG","msg":"error count=0","error":"none"}',
+                    '{"level":"INFO","msg":"retrying after transient error","err":"EOF"}',
+                    '{"level":"WARN","msg":"сводка об AS не записана","ошибка":"HTTP 504","error":"fatal timeout"}',
+                ]
+            )
+            + "\n",
             "",
         )
 
         report = run_smoke("center", fake, window_seconds=300, now=lambda: NOW)
 
         self.assertTrue(report.ok, report.failures)
+
+    def test_json_error_levels_and_plain_stderr_panic_are_failures(self) -> None:
+        fake = healthy_fake()
+        fake.logs[("rumap-center", "rumap-center-rumap-center-1")] = ExecResult(
+            ("docker", "logs"),
+            0,
+            "\n".join(
+                [
+                    '{"level":"INFO","msg":"error field ignored at INFO","error":"connection reset"}',
+                    '{"level":"ERROR","msg":"центр не отвечает"}',
+                    '{"level":"ERROR+4","msg":"критический сбой"}',
+                    '{"level":"FATAL","msg":"порт занят"}',
+                    '{"msg":"json без level со словом error"}',
+                ]
+            )
+            + "\n",
+            "panic: runtime error: invalid memory address or nil pointer dereference\n",
+        )
+
+        report = run_smoke("center", fake, window_seconds=300, now=lambda: NOW)
+
+        self.assertFalse(report.ok)
+        failure = next(f for f in report.failures if f.kind == "logs")
+        self.assertIn("5", failure.detail)
+        joined = " ".join(failure.evidence)
+        self.assertNotIn("error field ignored at INFO", joined)
+        self.assertIn("центр не отвечает", joined)
+        self.assertIn("критический сбой", joined)
+        self.assertIn("порт занят", joined)
+        self.assertIn("panic: runtime error", joined)
 
     def test_logs_unavailable(self) -> None:
         fake = healthy_fake()

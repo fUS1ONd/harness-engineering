@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from .deploy import (
+    DEFAULT_SMOKE_ATTEMPTS,
+    DEFAULT_SMOKE_INTERVAL_SECONDS,
     LAYER_ORDER,
     CommandResult,
     DeployProvider,
@@ -19,9 +21,11 @@ from .deploy import (
 )
 from .engine import collect_state, deploy_train, evaluate, handled_comment, release_pr_body, step
 from .github import (
+    WORKFLOW_NAME,
     GhCliProvider,
     GitHubProvider,
     ProviderError,
+    extract_pr_number,
     has_other_changes_requested,
     summarize_checks,
     to_pull_request,
@@ -53,6 +57,8 @@ __all__ = [
     "CommandResult",
     "Comparison",
     "Decision",
+    "DEFAULT_SMOKE_ATTEMPTS",
+    "DEFAULT_SMOKE_INTERVAL_SECONDS",
     "DeployProvider",
     "DeployReport",
     "DeployStep",
@@ -73,10 +79,12 @@ __all__ = [
     "SshDeployProvider",
     "TrainState",
     "WAIT_DEPLOY",
+    "WORKFLOW_NAME",
     "collect_state",
     "default_targets",
     "deploy_train",
     "evaluate",
+    "extract_pr_number",
     "has_other_changes_requested",
     "handled_comment",
     "release_pr_body",

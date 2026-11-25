@@ -21,7 +21,7 @@ FAILED_CONCLUSIONS = frozenset(
     {"failure", "timed_out", "action_required", "error", "startup_failure"}
 )
 MUTATING_ACTIONS = frozenset(
-    {"merged_to_dev", "opened_release_pr", "updated_release_pr", "merged_release_pr"}
+    {"merged_to_dev", "opened_release_pr", "merged_release_pr"}
 )
 
 
@@ -292,7 +292,9 @@ class Decision:
 
     @property
     def mutating(self) -> bool:
-        return self.action in MUTATING_ACTIONS or self.action == "ci_failed"
+        if self.action == "ci_failed":
+            return self.comment_target is not None
+        return self.action in MUTATING_ACTIONS
 
     def to_dict(self) -> dict:
         details = dict(self.details)

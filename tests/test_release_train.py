@@ -102,7 +102,12 @@ def run_ok(sha: str, workflow: str = "Проверка") -> CiRun:
     return CiRun(workflow=workflow, status="completed", conclusion="success", url=RUN_URL, sha=sha)
 
 
-def run_failed(sha: str, workflow: str = "Проверка", pr_number: int | None = None) -> CiRun:
+def run_failed(
+    sha: str,
+    workflow: str = "Проверка",
+    pr_number: int | None = None,
+    commit_message: str = "",
+) -> CiRun:
     return CiRun(
         workflow=workflow,
         status="completed",
@@ -110,6 +115,7 @@ def run_failed(sha: str, workflow: str = "Проверка", pr_number: int | No
         url=RUN_URL,
         sha=sha,
         pr_number=pr_number,
+        commit_message=commit_message,
     )
 
 
@@ -118,6 +124,7 @@ class FakeGitHub:
         self.heads = {"main": main_sha, "dev": dev_sha}
         self.prs: dict[str, list[PullRequest]] = {"dev": [], "main": []}
         self.ci: dict[str, BranchCi] = {"dev": BranchCi("dev"), "main": BranchCi("main")}
+        self.commit_prs: dict[str, int] = {}
         self.compare_ = Comparison()
         self.deploy_compare: Comparison | None = None
         self.paused = False
@@ -142,6 +149,9 @@ class FakeGitHub:
 
     def branch_head(self, repo: str, branch: str) -> str:
         return self.heads.get(branch, "")
+
+    def commit_pr(self, repo: str, sha: str) -> int | None:
+        return self.commit_prs.get(sha)
 
     def compare(self, repo: str, base: str, head: str) -> Comparison:
         if base == "main" and head == "dev":
@@ -243,10 +253,12 @@ class FakeDeployer:
         *,
         fail_deploy: Sequence[str] = (),
         fail_smoke: Sequence[str] = (),
+        fail_smoke_times: dict[str, int] | None = None,
     ) -> None:
         self.calls: list[tuple[str, str]] = []
         self.fail_deploy = set(fail_deploy)
         self.fail_smoke = set(fail_smoke)
+        self.fail_smoke_remaining = dict(fail_smoke_times or {})
 
     def deploy(self, target: DeployTarget) -> CommandResult:
         self.calls.append(("deploy", target.node))
@@ -256,9 +268,19 @@ class FakeDeployer:
             return CommandResult(argv, 0, "Container started", "")
         return CommandResult(argv, 1, "", "error: compose up failed")
 
+    def prune(self, target: DeployTarget) -> CommandResult:
+        self.calls.append(("prune", target.node))
+        argv = ("ssh", "--", target.host, target.prune_command())
+        return CommandResult(argv, 0, "Deleted Images", "")
+
     def smoke(self, role: str) -> SmokeOutcome:
         self.calls.append(("smoke", role))
-        ok = role not in self.fail_smoke
+        remaining = self.fail_smoke_remaining.get(role, 0)
+        if remaining > 0:
+            self.fail_smoke_remaining[role] = remaining - 1
+            ok = False
+        else:
+            ok = role not in self.fail_smoke
         report = {
             "role": role,
             "ok": ok,
@@ -429,7 +451,7 @@ class PromotionTest(unittest.TestCase):
         self.assertEqual(github.merged, [(60, DEV_SHA, False, "merge")])
         self.assertEqual(github.heads["main"], DEV_SHA)
 
-    def test_stale_release_pr_body_is_updated_before_merge(self) -> None:
+    def test_stale_release_pr_body_is_updated_during_merge(self) -> None:
         github, locks = FakeGitHub(), FakeLocks()
         github.ci["dev"] = BranchCi("dev", (run_ok(DEV_SHA),))
         github.compare_ = Comparison(ahead_by=1, commits=("feat: один",))
@@ -437,13 +459,13 @@ class PromotionTest(unittest.TestCase):
             make_pr(61, base="main", head_ref="dev", head_sha=DEV_SHA, body="старое описание")
         ]
 
-        updated = step(github, locks, REPO)
         merged = step(github, locks, REPO)
 
-        self.assertEqual(updated["action"], "updated_release_pr")
+        self.assertEqual(merged["action"], "merged_release_pr")
+        self.assertTrue(merged["details"]["body_updated"])
         self.assertEqual(github.updated[0][0], 61)
         self.assertIn(DEV_SHA, github.updated[0][1])
-        self.assertEqual(merged["action"], "merged_release_pr")
+        self.assertEqual(github.merged, [(61, DEV_SHA, False, "merge")])
 
     def test_release_pr_hold_and_label_removal_block_promotion(self) -> None:
         cases = {
@@ -521,7 +543,7 @@ class CiFailureTest(unittest.TestCase):
 
     def test_handled_dev_failure_does_not_mask_main_failure(self) -> None:
         github, locks = FakeGitHub(), FakeLocks()
-        github.ci["dev"] = BranchCi("dev", (run_failed(DEV_SHA),))
+        github.ci["dev"] = BranchCi("dev", (run_failed(DEV_SHA, pr_number=41),))
         github.ci["main"] = BranchCi("main", (run_failed(MAIN_SHA, "Проверка", pr_number=42),))
 
         first = step(github, locks, REPO)
@@ -529,8 +551,54 @@ class CiFailureTest(unittest.TestCase):
 
         self.assertEqual(first["action"], "ci_failed")
         self.assertEqual(second["action"], "ci_failed")
-        self.assertEqual([number for number, _ in github.comments], [42])
+        self.assertEqual([number for number, _ in github.comments], [41, 42])
         self.assertIn("main", second["summary"])
+
+    def test_failed_branch_ci_resolves_pr_via_commit_api(self) -> None:
+        github, locks = FakeGitHub(), FakeLocks()
+        github.ci["main"] = BranchCi("main", (run_failed(MAIN_SHA, "Проверка", pr_number=None),))
+        github.commit_prs[MAIN_SHA] = 77
+
+        result = step(github, locks, REPO)
+
+        self.assertEqual(result["action"], "ci_failed")
+        self.assertEqual(result["thread_action"], SETTLE)
+        self.assertEqual(github.comments[0][0], 77)
+
+    def test_failed_branch_ci_resolves_pr_from_commit_message(self) -> None:
+        cases = (
+            ("main", MAIN_SHA, "Merge pull request #88 from rumap/dev", 88),
+            ("dev", DEV_SHA, "fix: поломка (#89)", 89),
+        )
+        for branch, sha, message, expected_pr in cases:
+            with self.subTest(branch=branch):
+                github, locks = FakeGitHub(), FakeLocks()
+                github.ci[branch] = BranchCi(
+                    branch, (run_failed(sha, "Проверка", pr_number=None, commit_message=message),)
+                )
+
+                result = step(github, locks, REPO)
+
+                self.assertEqual(result["action"], "ci_failed")
+                self.assertEqual(result["thread_action"], SETTLE)
+                self.assertEqual(github.comments[0][0], expected_pr)
+
+    def test_failed_branch_ci_without_pr_alerts_open_and_does_not_lock(self) -> None:
+        github, locks = FakeGitHub(), FakeLocks()
+        github.ci["main"] = BranchCi(
+            "main",
+            (run_failed(MAIN_SHA, "Проверка", pr_number=None, commit_message="chore: прямой пуш"),),
+        )
+
+        first = step(github, locks, REPO)
+        second = step(github, locks, REPO)
+
+        self.assertEqual(first["action"], "ci_failed")
+        self.assertEqual(first["thread_action"], ALERT_OPEN)
+        self.assertEqual(github.comments, [])
+        self.assertEqual(locks.held, set())
+        self.assertEqual(second["action"], "ci_failed")
+        self.assertEqual(second["thread_action"], ALERT_OPEN)
 
     def test_failed_dev_ci_comments_on_release_pr(self) -> None:
         github, locks = FakeGitHub(), FakeLocks()
@@ -689,11 +757,18 @@ class IdempotencyTest(unittest.TestCase):
 
 
 class DeployTest(unittest.TestCase):
+    def ready_github(self) -> FakeGitHub:
+        github = FakeGitHub()
+        github.ci["main"] = BranchCi("main", (run_ok(MAIN_SHA),))
+        return github
+
     def deploy(self, github: FakeGitHub, locks: FakeLocks, deployer: FakeDeployer, **kwargs):
+        kwargs.setdefault("sleep", lambda _: None)
+        kwargs.setdefault("smoke_attempts", 1)
         return deploy_train(github, locks, deployer, REPO, **kwargs)
 
-    def test_three_layers_in_order_with_smoke_gates(self) -> None:
-        github, locks, deployer = FakeGitHub(), FakeLocks(), FakeDeployer()
+    def test_three_layers_in_order_with_smoke_gates_and_post_smoke_prune(self) -> None:
+        github, locks, deployer = self.ready_github(), FakeLocks(), FakeDeployer()
 
         report = self.deploy(github, locks, deployer)
 
@@ -702,19 +777,51 @@ class DeployTest(unittest.TestCase):
         self.assertEqual(
             deployer.calls,
             [
-                ("deploy", "center"),
-                ("smoke", "center"),
+                ("deploy", "point"),
+                ("smoke", "point"),
                 ("deploy", "worker-ru"),
                 ("deploy", "worker-control"),
                 ("smoke", "worker"),
-                ("deploy", "point"),
-                ("smoke", "point"),
+                ("deploy", "center"),
+                ("smoke", "center"),
+                ("prune", "center"),
             ],
         )
         self.assertEqual(locks.deployed, MAIN_SHA)
+        self.assertIn("point → worker → center", report.summary())
 
-    def test_fail_fast_on_center_smoke_stops_worker_and_point(self) -> None:
-        github, locks = FakeGitHub(), FakeLocks()
+    def test_fail_fast_on_point_smoke_stops_worker_and_center(self) -> None:
+        github, locks = self.ready_github(), FakeLocks()
+        deployer = FakeDeployer(fail_smoke={"point"})
+
+        report = self.deploy(github, locks, deployer)
+
+        self.assertFalse(report.ok)
+        self.assertEqual(report.failed_layer, "point")
+        self.assertEqual(report.thread_action, ALERT_OPEN)
+        self.assertEqual(report.untouched, ("worker-ru", "worker-control", "center"))
+        self.assertEqual(deployer.calls, [("deploy", "point"), ("smoke", "point")])
+        self.assertIsNone(locks.deployed)
+        self.assertFalse(any(step.stage == "rollback" for step in report.steps))
+        evidence = " ".join(e for step in report.steps for e in step.evidence)
+        self.assertIn("ERROR", evidence)
+        self.assertIn("авто-откат", report.summary())
+
+    def test_fail_fast_on_worker_smoke_leaves_center_untouched(self) -> None:
+        github, locks = self.ready_github(), FakeLocks()
+        deployer = FakeDeployer(fail_smoke={"worker"})
+
+        report = self.deploy(github, locks, deployer)
+
+        self.assertFalse(report.ok)
+        self.assertEqual(report.failed_layer, "worker")
+        self.assertEqual(report.untouched, ("center",))
+        self.assertNotIn(("deploy", "center"), deployer.calls)
+        self.assertNotIn(("smoke", "center"), deployer.calls)
+        self.assertNotIn(("prune", "center"), deployer.calls)
+
+    def test_fail_fast_on_center_smoke_does_not_prune(self) -> None:
+        github, locks = self.ready_github(), FakeLocks()
         deployer = FakeDeployer(fail_smoke={"center"})
 
         report = self.deploy(github, locks, deployer)
@@ -722,38 +829,63 @@ class DeployTest(unittest.TestCase):
         self.assertFalse(report.ok)
         self.assertEqual(report.failed_layer, "center")
         self.assertEqual(report.thread_action, ALERT_OPEN)
-        self.assertEqual(report.untouched, ("worker-ru", "worker-control", "point"))
-        self.assertEqual(deployer.calls, [("deploy", "center"), ("smoke", "center")])
+        self.assertNotIn(("prune", "center"), deployer.calls)
         self.assertIsNone(locks.deployed)
-        self.assertFalse(any(step.stage == "rollback" for step in report.steps))
-        evidence = " ".join(e for step in report.steps for e in step.evidence)
-        self.assertIn("ERROR", evidence)
-        self.assertIn("авто-откат", report.summary())
-
-    def test_fail_fast_on_worker_smoke_leaves_point_untouched(self) -> None:
-        github, locks = FakeGitHub(), FakeLocks()
-        deployer = FakeDeployer(fail_smoke={"worker"})
-
-        report = self.deploy(github, locks, deployer)
-
-        self.assertFalse(report.ok)
-        self.assertEqual(report.failed_layer, "worker")
-        self.assertEqual(report.untouched, ("point",))
-        self.assertNotIn(("deploy", "point"), deployer.calls)
-        self.assertNotIn(("smoke", "point"), deployer.calls)
 
     def test_deploy_failure_before_smoke_also_stops(self) -> None:
-        github, locks = FakeGitHub(), FakeLocks()
+        github, locks = self.ready_github(), FakeLocks()
         deployer = FakeDeployer(fail_deploy={"worker-control"})
 
         report = self.deploy(github, locks, deployer)
 
         self.assertFalse(report.ok)
         self.assertEqual(report.failed_layer, "worker")
-        self.assertEqual([call for call in deployer.calls if call[0] == "smoke"], [("smoke", "center")])
+        self.assertEqual([call for call in deployer.calls if call[0] == "smoke"], [("smoke", "point")])
+
+    def test_smoke_warmup_retries_before_passing(self) -> None:
+        github, locks = self.ready_github(), FakeLocks()
+        deployer = FakeDeployer(fail_smoke_times={"worker": 2})
+        sleeps: list[float] = []
+
+        report = deploy_train(
+            github,
+            locks,
+            deployer,
+            REPO,
+            smoke_attempts=4,
+            smoke_interval=3.0,
+            sleep=sleeps.append,
+        )
+
+        self.assertTrue(report.ok)
+        self.assertEqual(sleeps, [3.0, 3.0])
+        worker_smoke_step = next(s for s in report.steps if s.layer == "worker" and s.stage == "smoke")
+        self.assertIn("попытка 3/4", worker_smoke_step.detail)
+        self.assertIn(("prune", "center"), deployer.calls)
+
+    def test_smoke_warmup_exhausts_attempts_and_fails_fast(self) -> None:
+        github, locks = self.ready_github(), FakeLocks()
+        deployer = FakeDeployer(fail_smoke={"point"})
+        sleeps: list[float] = []
+
+        report = deploy_train(
+            github,
+            locks,
+            deployer,
+            REPO,
+            smoke_attempts=3,
+            smoke_interval=2.0,
+            sleep=sleeps.append,
+        )
+
+        self.assertFalse(report.ok)
+        self.assertEqual(report.failed_layer, "point")
+        self.assertEqual(sleeps, [2.0, 2.0])
+        self.assertEqual(deployer.calls.count(("smoke", "point")), 3)
+        self.assertIsNone(locks.deployed)
 
     def test_deploy_blocked_by_repo_pause(self) -> None:
-        github, locks, deployer = FakeGitHub(), FakeLocks(), FakeDeployer()
+        github, locks, deployer = self.ready_github(), FakeLocks(), FakeDeployer()
         github.paused = True
 
         report = self.deploy(github, locks, deployer)
@@ -764,7 +896,7 @@ class DeployTest(unittest.TestCase):
         self.assertEqual(report.thread_action, SETTLE)
 
     def test_deploy_blocked_by_pause_file(self) -> None:
-        github, locks, deployer = FakeGitHub(), FakeLocks(paused=True), FakeDeployer()
+        github, locks, deployer = self.ready_github(), FakeLocks(paused=True), FakeDeployer()
 
         report = self.deploy(github, locks, deployer)
 
@@ -773,7 +905,7 @@ class DeployTest(unittest.TestCase):
         self.assertEqual(deployer.calls, [])
 
     def test_deploy_refuses_sha_that_moved(self) -> None:
-        github, locks, deployer = FakeGitHub(), FakeLocks(), FakeDeployer()
+        github, locks, deployer = self.ready_github(), FakeLocks(), FakeDeployer()
 
         report = self.deploy(github, locks, deployer, expected_sha=OLDER_SHA)
 
@@ -782,8 +914,34 @@ class DeployTest(unittest.TestCase):
         self.assertEqual(report.thread_action, ALERT_OPEN)
         self.assertEqual(deployer.calls, [])
 
+    def test_deploy_refuses_when_main_ci_not_green_for_target_sha(self) -> None:
+        cases = {
+            "none": BranchCi("main"),
+            "pending": BranchCi(
+                "main",
+                (
+                    CiRun(workflow="Проверка", status="in_progress", sha=MAIN_SHA, url=RUN_URL),
+                    run_ok(MAIN_SHA),
+                ),
+            ),
+            "failed": BranchCi("main", (run_failed(MAIN_SHA),)),
+            "stale_sha": BranchCi("main", (run_ok(OLDER_SHA),)),
+        }
+        for name, branch_ci in cases.items():
+            with self.subTest(case=name):
+                github, locks, deployer = FakeGitHub(), FakeLocks(), FakeDeployer()
+                github.ci["main"] = branch_ci
+
+                report = self.deploy(github, locks, deployer)
+
+                self.assertFalse(report.ok)
+                self.assertEqual(report.action, "ci_not_ready")
+                self.assertEqual(report.thread_action, ALERT_OPEN)
+                self.assertEqual(deployer.calls, [])
+                self.assertIsNone(locks.deployed)
+
     def test_repeated_deploy_after_success_is_recorded(self) -> None:
-        github, locks, deployer = FakeGitHub(), FakeLocks(), FakeDeployer()
+        github, locks, deployer = self.ready_github(), FakeLocks(), FakeDeployer()
         self.deploy(github, locks, deployer)
 
         deployer.calls.clear()
@@ -798,6 +956,8 @@ class DeployTest(unittest.TestCase):
                 MAIN_SHA,
                 FakeDeployer(),
                 targets=(DeployTarget(layer="center", node="center", host="h", directory="/d"),),
+                smoke_attempts=1,
+                sleep=lambda _: None,
             )
 
 
@@ -820,11 +980,12 @@ class ProdSmokeIntegrationTest(unittest.TestCase):
         deployer = FakeDeployer()
         deployer.smoke = provider.smoke  # type: ignore[method-assign]
 
-        report = run_deploy(MAIN_SHA, deployer)
+        report = run_deploy(MAIN_SHA, deployer, smoke_attempts=1, sleep=lambda _: None)
 
         self.assertFalse(report.ok)
         self.assertEqual(report.failed_layer, "center")
         self.assertIn("RestartCount=3", " ".join(report.steps[-1].evidence))
+        self.assertNotIn(("prune", "center"), deployer.calls)
 
     def test_prod_smoke_json_contract_roundtrip(self) -> None:
         out = io.StringIO()
@@ -866,13 +1027,21 @@ class FileLockStoreTest(unittest.TestCase):
 
 
 class GitHubAdapterTest(unittest.TestCase):
-    def test_summarize_checks_states(self) -> None:
+    def test_summarize_checks_filters_workflow_and_ignores_foreign_checks(self) -> None:
         rollup = [
-            {"name": "Тесты", "status": "COMPLETED", "conclusion": "SUCCESS"},
-            {"name": "Линт", "status": "COMPLETED", "conclusion": "FAILURE", "detailsUrl": RUN_URL},
-            {"name": "Сборка", "status": "IN_PROGRESS", "conclusion": ""},
+            {"workflowName": "Проверка", "name": "Тесты", "status": "COMPLETED", "conclusion": "SUCCESS"},
+            {
+                "workflowName": "Проверка",
+                "name": "Линт",
+                "status": "COMPLETED",
+                "conclusion": "FAILURE",
+                "detailsUrl": RUN_URL,
+            },
+            {"workflowName": "Проверка", "name": "Сборка", "status": "IN_PROGRESS", "conclusion": ""},
+            {"workflowName": "Release Train Trigger", "name": "notify", "status": "COMPLETED", "conclusion": "FAILURE"},
+            {"workflowName": "PR Review Gate Trigger", "name": "notify", "status": "COMPLETED", "conclusion": "SUCCESS"},
             {"context": "legacy", "state": "PENDING"},
-            {"name": "Шум", "status": "COMPLETED", "conclusion": "SKIPPED"},
+            {"workflowName": "Проверка", "name": "Шум", "status": "COMPLETED", "conclusion": "SKIPPED"},
         ]
 
         summary = summarize_checks(rollup)
@@ -880,9 +1049,61 @@ class GitHubAdapterTest(unittest.TestCase):
         self.assertEqual(summary.state, "failed")
         self.assertEqual([check.name for check in summary.failed], ["Линт"])
         self.assertEqual(summary.failed[0].url, RUN_URL)
-        self.assertEqual({check.name for check in summary.pending}, {"Сборка", "legacy"})
+        self.assertEqual({check.name for check in summary.pending}, {"Сборка"})
         self.assertEqual(summary.passed, 1)
         self.assertEqual(summary.skipped, 1)
+
+        only_trigger = [
+            {"workflowName": "Release Train Trigger", "name": "notify", "status": "COMPLETED", "conclusion": "SUCCESS"}
+        ]
+        self.assertEqual(summarize_checks(only_trigger).state, "none")
+
+    def test_summarize_checks_deduplicates_reruns_keeping_latest(self) -> None:
+        rerun_green = [
+            {
+                "workflowName": "Проверка",
+                "name": "Тесты (center)",
+                "status": "COMPLETED",
+                "conclusion": "SUCCESS",
+                "startedAt": "2026-11-25T10:10:00Z",
+                "completedAt": "2026-11-25T10:15:00Z",
+            },
+            {
+                "workflowName": "Проверка",
+                "name": "Тесты (center)",
+                "status": "COMPLETED",
+                "conclusion": "FAILURE",
+                "startedAt": "2026-11-25T10:00:00Z",
+                "completedAt": "2026-11-25T10:05:00Z",
+                "detailsUrl": RUN_URL,
+            },
+        ]
+        summary_green = summarize_checks(rerun_green)
+        self.assertEqual(summary_green.state, "passed")
+        self.assertEqual(summary_green.passed, 1)
+        self.assertEqual(summary_green.failed, ())
+
+        rerun_in_progress = [
+            {
+                "workflowName": "Проверка",
+                "name": "Тесты (center)",
+                "status": "COMPLETED",
+                "conclusion": "FAILURE",
+                "startedAt": "2026-11-25T10:00:00Z",
+                "completedAt": "2026-11-25T10:05:00Z",
+            },
+            {
+                "workflowName": "Проверка",
+                "name": "Тесты (center)",
+                "status": "IN_PROGRESS",
+                "conclusion": "",
+                "startedAt": "2026-11-25T10:10:00Z",
+                "completedAt": None,
+            },
+        ]
+        summary_pending = summarize_checks(rerun_in_progress)
+        self.assertEqual(summary_pending.state, "pending")
+        self.assertEqual(summary_pending.failed, ())
 
     def test_pull_request_parsing_and_changes_requested(self) -> None:
         item = {
@@ -895,7 +1116,9 @@ class GitHubAdapterTest(unittest.TestCase):
             "isDraft": False,
             "labels": [{"name": "release-train"}],
             "mergeable": "MERGEABLE",
-            "statusCheckRollup": [{"name": "Тесты", "status": "COMPLETED", "conclusion": "SUCCESS"}],
+            "statusCheckRollup": [
+                {"workflowName": "Проверка", "name": "Тесты", "status": "COMPLETED", "conclusion": "SUCCESS"}
+            ],
             "reviews": [
                 {"author": {"login": "reviewer"}, "state": "APPROVED"},
                 {"author": {"login": "reviewer"}, "state": "CHANGES_REQUESTED"},
@@ -912,9 +1135,41 @@ class GitHubAdapterTest(unittest.TestCase):
         self.assertEqual(pr.head_sha, PR_HEAD)
 
     def test_gh_provider_parses_runs_variable_and_compare(self) -> None:
+        release_pr_payload = {
+            "number": 90,
+            "title": "release-train: dev → main",
+            "url": "https://github.com/rumap/rumap/pull/90",
+            "baseRefName": "main",
+            "headRefName": "dev",
+            "headRefOid": DEV_SHA,
+            "isDraft": False,
+            "labels": [{"name": "release-train"}],
+            "mergeable": "MERGEABLE",
+            "statusCheckRollup": [],
+            "reviews": [],
+            "author": {"login": "bot"},
+            "body": "",
+        }
         responses = {
             ("gh", "pr", "list", "--repo", REPO, "--base", "dev", "--state", "open", "--limit", "100", "--json", PR_FIELDS): [],
-            ("gh", "api", f"repos/{REPO}/actions/workflows/ci.yml/runs?branch=dev&per_page=20"): {
+            (
+                "gh",
+                "pr",
+                "list",
+                "--repo",
+                REPO,
+                "--base",
+                "main",
+                "--head",
+                "dev",
+                "--state",
+                "open",
+                "--limit",
+                "1",
+                "--json",
+                PR_FIELDS,
+            ): [release_pr_payload],
+            ("gh", "api", f"repos/{REPO}/actions/workflows/ci.yml/runs?branch=dev&event=push&per_page=20"): {
                 "workflow_runs": [
                     {
                         "name": "Проверка",
@@ -936,6 +1191,7 @@ class GitHubAdapterTest(unittest.TestCase):
                     },
                 ]
             },
+            ("gh", "api", f"repos/{REPO}/commits/{DEV_SHA}/pulls?per_page=5"): [{"number": 55}],
             ("gh", "api", f"repos/{REPO}/compare/main...dev"): {
                 "ahead_by": 2,
                 "behind_by": 0,
@@ -962,6 +1218,8 @@ class GitHubAdapterTest(unittest.TestCase):
         provider = GhCliProvider(run=runner)
         ci = provider.branch_ci(REPO, "dev")
         compare = provider.compare(REPO, "main", "dev")
+        rel = provider.release_pr(REPO, base="main", head="dev")
+        pr_num = provider.commit_pr(REPO, DEV_SHA)
 
         self.assertTrue(all(call[0] == "gh" for call in seen))
         self.assertEqual(ci.state, "pending")
@@ -971,6 +1229,9 @@ class GitHubAdapterTest(unittest.TestCase):
         self.assertEqual(compare.ahead_by, 2)
         self.assertEqual(compare.pull_requests, (55, 56))
         self.assertEqual(provider.open_prs(REPO, "dev"), ())
+        self.assertIsNotNone(rel)
+        self.assertEqual(rel.number, 90)
+        self.assertEqual(pr_num, 55)
 
     def test_gh_provider_wraps_timeout_and_os_error(self) -> None:
         import subprocess as _sp
@@ -1066,14 +1327,27 @@ class GitHubAdapterTest(unittest.TestCase):
         self.assertEqual(create[create.index("--label") + 1], RELEASE_TRAIN_LABEL)
 
     def test_default_targets_commands_expand_home_and_quote_custom_paths(self) -> None:
-        from release_train.deploy import default_targets
+        from release_train.deploy import LAYER_ORDER, default_targets
 
-        by_node = {target.node: target.command() for target in default_targets()}
-        self.assertTrue(by_node["center"].startswith("cd /opt/rumap-center && "))
-        self.assertTrue(by_node["worker-ru"].startswith('cd "$HOME"/rumap-v2/deploy/worker && '))
-        self.assertTrue(by_node["point"].startswith('cd "$HOME"/rumap-v2/deploy/point && '))
-        self.assertNotIn("'$HOME", by_node["worker-ru"])
-        self.assertNotIn("'$HOME", by_node["point"])
+        targets = default_targets()
+        self.assertEqual(LAYER_ORDER, ("point", "worker", "center"))
+        self.assertEqual([target.node for target in targets], ["point", "worker-ru", "worker-control", "center"])
+
+        by_node = {target.node: target for target in targets}
+        self.assertEqual(
+            by_node["center"].command(),
+            "cd /opt/rumap-center && docker compose pull rumap-center && docker compose up -d rumap-center",
+        )
+        self.assertTrue(by_node["center"].prune)
+        self.assertEqual(
+            by_node["center"].prune_command(),
+            "cd /opt/rumap-center && docker image prune -f",
+        )
+        self.assertNotIn("image prune", by_node["center"].command())
+        self.assertTrue(by_node["worker-ru"].command().startswith('cd "$HOME"/rumap-v2/deploy/worker && '))
+        self.assertTrue(by_node["point"].command().startswith('cd "$HOME"/rumap-v2/deploy/point && '))
+        self.assertNotIn("'$HOME", by_node["worker-ru"].command())
+        self.assertNotIn("'$HOME", by_node["point"].command())
 
         custom = DeployTarget(
             layer="center",
@@ -1121,9 +1395,10 @@ class CliTest(unittest.TestCase):
 
     def test_deploy_cli_exit_codes_and_text(self) -> None:
         github, locks = FakeGitHub(), FakeLocks()
+        github.ci["main"] = BranchCi("main", (run_ok(MAIN_SHA),))
         out = io.StringIO()
         code = main(
-            ["deploy", "--format", "both"],
+            ["deploy", "--format", "both", "--smoke-attempts", "1"],
             provider=github,
             locks=locks,
             deployer=FakeDeployer(),
@@ -1138,12 +1413,13 @@ class CliTest(unittest.TestCase):
         self.assertIn("release-train deploy: OK", payload["text"])
 
         github_fail = FakeGitHub()
+        github_fail.ci["main"] = BranchCi("main", (run_ok(MAIN_SHA),))
         out_fail = io.StringIO()
         code_fail = main(
-            ["deploy", "--format", "text"],
+            ["deploy", "--format", "text", "--smoke-attempts", "1"],
             provider=github_fail,
             locks=FakeLocks(),
-            deployer=FakeDeployer(fail_smoke={"center"}),
+            deployer=FakeDeployer(fail_smoke={"point"}),
             stdout=out_fail,
         )
         self.assertEqual(code_fail, 1)

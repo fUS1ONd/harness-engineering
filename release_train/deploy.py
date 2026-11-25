@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import shlex
 import subprocess
+import time
 from dataclasses import dataclass
 from typing import Callable, Protocol, Sequence
 
@@ -13,7 +14,9 @@ from prod_smoke.transport import SshTransport, Transport
 
 from .model import ALERT_OPEN, SETTLE
 
-LAYER_ORDER = ("center", "worker", "point")
+LAYER_ORDER = ("point", "worker", "center")
+DEFAULT_SMOKE_ATTEMPTS = 6
+DEFAULT_SMOKE_INTERVAL_SECONDS = 5.0
 MAX_EVIDENCE_LINES = 8
 MAX_EVIDENCE_CHARS = 500
 
@@ -72,9 +75,10 @@ class DeployTarget:
             (*self.docker, "compose", "pull", *self.services),
             (*self.docker, "compose", "up", "-d", *self.services),
         ]
-        if self.prune:
-            steps.append((*self.docker, "image", "prune", "-f"))
         return f"cd {_quote_dir(self.directory)} && " + " && ".join(shlex.join(step) for step in steps)
+
+    def prune_command(self) -> str:
+        return f"cd {_quote_dir(self.directory)} && " + shlex.join((*self.docker, "image", "prune", "-f"))
 
     def to_dict(self) -> dict:
         return {
@@ -83,19 +87,20 @@ class DeployTarget:
             "host": self.host,
             "directory": self.directory,
             "command": self.command(),
+            "prune": self.prune,
         }
 
 
 def default_targets() -> tuple[DeployTarget, ...]:
-    """Порядок узлов внутри слоя — как в `docs/vykladka.md` у репозитория `rumap`."""
+    """Порядок слоёв и узлов — `point → worker → center` по `docs/vykladka.md` и ADR-0075."""
     return (
         DeployTarget(
-            layer="center",
-            node="center",
-            host="rumap-center",
-            directory="/opt/rumap-center",
-            docker=("docker",),
-            prune=True,
+            layer="point",
+            node="point",
+            host="home",
+            directory="$HOME/rumap-v2/deploy/point",
+            docker=("sudo", "-n", "docker"),
+            services=("rumapd",),
         ),
         DeployTarget(
             layer="worker",
@@ -113,12 +118,13 @@ def default_targets() -> tuple[DeployTarget, ...]:
             services=("rumap-worker",),
         ),
         DeployTarget(
-            layer="point",
-            node="point",
-            host="home",
-            directory="$HOME/rumap-v2/deploy/point",
-            docker=("sudo", "-n", "docker"),
-            services=("rumapd",),
+            layer="center",
+            node="center",
+            host="rumap-center",
+            directory="/opt/rumap-center",
+            docker=("docker",),
+            services=("rumap-center",),
+            prune=True,
         ),
     )
 
@@ -129,6 +135,8 @@ class SmokeProvider(Protocol):
 
 class DeployProvider(SmokeProvider, Protocol):
     def deploy(self, target: DeployTarget) -> CommandResult: ...
+
+    def prune(self, target: DeployTarget) -> CommandResult: ...
 
 
 class SshDeployProvider:
@@ -152,7 +160,7 @@ class SshDeployProvider:
             SshTransport(ssh=ssh), window_seconds=smoke_window
         )
 
-    def deploy(self, target: DeployTarget) -> CommandResult:
+    def _exec_ssh(self, host: str, command: str) -> CommandResult:
         argv = (
             self.ssh,
             "-o",
@@ -160,16 +168,22 @@ class SshDeployProvider:
             "-o",
             f"ConnectTimeout={self.connect_timeout}",
             "--",
-            target.host,
-            target.command(),
+            host,
+            command,
         )
         try:
             done = self._run(argv, self.timeout)
         except subprocess.TimeoutExpired:
-            return CommandResult(argv, 255, "", f"таймаут {self.timeout:g} с: ssh {target.host}")
+            return CommandResult(argv, 255, "", f"таймаут {self.timeout:g} с: ssh {host}")
         except OSError as exc:
-            return CommandResult(argv, 255, "", f"ssh {target.host}: {exc}")
+            return CommandResult(argv, 255, "", f"ssh {host}: {exc}")
         return CommandResult(argv, done.returncode, done.stdout or "", done.stderr or "")
+
+    def deploy(self, target: DeployTarget) -> CommandResult:
+        return self._exec_ssh(target.host, target.command())
+
+    def prune(self, target: DeployTarget) -> CommandResult:
+        return self._exec_ssh(target.host, target.prune_command())
 
     def smoke(self, role: str) -> SmokeOutcome:
         return self._smoke.smoke(role)
@@ -261,11 +275,11 @@ class DeployReport:
     def summary(self) -> str:
         if self.action == "paused":
             return f"Выкатка заблокирована стоп-краном: {self.reason}. Ничего не тронуто."
-        if self.action == "sha_moved":
+        if self.action in {"sha_moved", "ci_not_ready"}:
             return f"Выкатка отменена: {self.reason}"
         if self.ok:
             return (
-                "Выкатка выполнена на всех 3 слоях: center → worker → point, "
+                "Выкатка выполнена на всех 3 слоях: point → worker → center, "
                 f"prod-smoke зелёный (sha {self.sha or '?'})."
             )
         return (
@@ -279,8 +293,15 @@ def run_deploy(
     provider: DeployProvider,
     *,
     targets: Sequence[DeployTarget] | None = None,
+    smoke_attempts: int = DEFAULT_SMOKE_ATTEMPTS,
+    smoke_interval: float = DEFAULT_SMOKE_INTERVAL_SECONDS,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> DeployReport:
-    """Строго `center → smoke → worker → smoke → point → smoke`, остановка на первом провале."""
+    """Строго `point → smoke → worker → smoke → center → smoke`, остановка на первом провале."""
+    if smoke_attempts < 1:
+        raise ValueError("smoke_attempts должен быть не меньше 1")
+    if smoke_interval < 0:
+        raise ValueError("smoke_interval не может быть отрицательным")
     plan = tuple(targets if targets is not None else default_targets())
     missing = [layer for layer in LAYER_ORDER if not any(target.layer == layer for target in plan)]
     if missing:
@@ -312,7 +333,18 @@ def run_deploy(
                     f"деплой узла {target.node} вернул код {result.returncode}",
                 )
 
-        outcome = provider.smoke(layer)
+        outcome: SmokeOutcome | None = None
+        attempts_used = 0
+        for attempt in range(1, smoke_attempts + 1):
+            attempts_used = attempt
+            outcome = provider.smoke(layer)
+            if outcome.ok:
+                break
+            if attempt < smoke_attempts and smoke_interval > 0:
+                sleep(smoke_interval)
+        assert outcome is not None
+
+        attempt_suffix = f" (попытка {attempts_used}/{smoke_attempts})" if attempts_used > 1 else ""
         steps.append(
             DeployStep(
                 layer=layer,
@@ -320,9 +352,13 @@ def run_deploy(
                 target=layer,
                 ok=outcome.ok,
                 detail=(
-                    f"prod-smoke --role {layer}: OK"
+                    f"prod-smoke --role {layer}: OK{attempt_suffix}"
                     if outcome.ok
-                    else outcome.error or f"prod-smoke --role {layer}: провалов {len(outcome.failures)}"
+                    else (
+                        outcome.error
+                        or f"prod-smoke --role {layer}: провалов {len(outcome.failures)}"
+                    )
+                    + attempt_suffix
                 ),
                 evidence=_smoke_evidence(outcome),
             )
@@ -334,6 +370,23 @@ def run_deploy(
                 plan,
                 layer,
                 outcome.error or f"prod-smoke на слое {layer} провалился",
+            )
+
+        for target in layer_targets:
+            if not target.prune:
+                continue
+            prune_result = provider.prune(target)
+            steps.append(
+                DeployStep(
+                    layer=layer,
+                    stage="prune",
+                    target=target.node,
+                    ok=prune_result.ok,
+                    detail=f"{target.host}: docker image prune -f — код {prune_result.returncode}",
+                    command=prune_result.argv,
+                    returncode=prune_result.returncode,
+                    evidence=_command_evidence(prune_result),
+                )
             )
 
     return DeployReport(ok=True, sha=sha, steps=tuple(steps), action="deployed", thread_action=SETTLE)
@@ -399,7 +452,7 @@ def render_deploy_text(report: DeployReport) -> str:
         lines.append(f"  {mark} {step.stage} {step.target}: {step.detail}")
         for snippet in step.evidence:
             lines.append(f"      {snippet}")
-    if not report.ok and report.action not in {"paused", "sha_moved"}:
+    if not report.ok and report.action not in {"paused", "sha_moved", "ci_not_ready"}:
         if report.untouched:
             lines.append(f"Не тронуто: {', '.join(report.untouched)}")
         lines.append("Авто-откат не выполнялся — решение об откате или фиксе за владельцем.")
