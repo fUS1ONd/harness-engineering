@@ -11,20 +11,26 @@ jobs:
     if: >-
       github.event.issue.pull_request == null &&
       github.event.issue.assignee == null &&
-      !contains(github.event.issue.labels.*.name, 'status:ready-for-agent') &&
       !contains(github.event.issue.labels.*.name, 'status:in-progress') &&
-      !contains(github.event.issue.labels.*.name, 'status:needs-owner') &&
       !contains(github.event.issue.labels.*.name, 'status:blocked') &&
       !contains(github.event.issue.labels.*.name, 'status:review') &&
       !contains(github.event.issue.labels.*.name, 'contributor') &&
       !contains(github.event.issue.labels.*.name, 'human-only') &&
       !contains(github.event.issue.labels.*.name, 'enhancement') &&
       !contains(github.event.issue.labels.*.name, 'question') &&
+      !contains(github.event.issue.labels.*.name, 'type:epic') &&
+      !contains(github.event.issue.labels.*.name, 'documentation') &&
+      !contains(github.event.issue.labels.*.name, 'duplicate') &&
+      !contains(github.event.issue.labels.*.name, 'invalid') &&
+      !contains(github.event.issue.labels.*.name, 'wontfix') &&
+      !contains(github.event.issue.labels.*.name, 'area:roadmap') &&
       (
-        (github.event_name == 'issues' && github.event.action == 'opened') ||
+        (github.event_name == 'issues' && github.event.action == 'opened' &&
+          !contains(github.event.issue.labels.*.name, 'status:ready-for-agent') &&
+          !contains(github.event.issue.labels.*.name, 'status:needs-owner')) ||
         (github.event_name == 'issues' && github.event.action == 'labeled' && github.event.label.name == 'status:needs-triage') ||
         (github.event_name == 'issue_comment' && github.event.action == 'created' &&
-          (startsWith(github.event.comment.body, '/benny') || startsWith(github.event.comment.body, '/triage')))
+          (contains(github.event.comment.body, '/benny') || contains(github.event.comment.body, '/triage')))
       )
     runs-on: ubuntu-latest
     steps:

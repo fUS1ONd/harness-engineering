@@ -76,6 +76,8 @@ class FakeGitHub:
         self.mutations: list[dict] = []
         self.calls: list[list[str]] = []
         self.comment_error = False
+        self.edit_error = False
+        self.fail_on_call = None
 
     def add(self, repo: str, raw_issue: dict) -> dict:
         self.issues[(repo, raw_issue["number"])] = raw_issue
@@ -88,17 +90,30 @@ class FakeGitHub:
             "created_at": created_at,
         })
 
-    def __call__(self, cmd: list[str], check: bool = True) -> subprocess.CompletedProcess:
+    def __call__(
+        self,
+        cmd: list[str],
+        check: bool = True,
+        *,
+        input_text: str | None = None,
+    ) -> subprocess.CompletedProcess:
         self.calls.append(list(cmd))
         if cmd[0] != "gh":
             raise AssertionError(f"unexpected command: {cmd}")
+        if self.fail_on_call is not None and self.fail_on_call(cmd):
+            result = self._fail()
+            if check:
+                raise subprocess.CalledProcessError(
+                    result.returncode, cmd, result.stdout, result.stderr
+                )
+            return result
         args = cmd[1:]
         if args[:2] == ["issue", "list"]:
             result = self._ok(self._list(args))
         elif args[:2] == ["issue", "view"]:
             result = self._view(args)
         elif args[:2] == ["issue", "comment"]:
-            result = self._comment(args)
+            result = self._comment(args, input_text=input_text)
         elif args[:2] == ["issue", "edit"]:
             result = self._edit(args)
         elif args[:1] == ["api"]:
@@ -166,24 +181,38 @@ class FakeGitHub:
     def _pr_view(self, args: list[str]) -> subprocess.CompletedProcess:
         return self._fail()
 
-    def _comment(self, args: list[str]) -> subprocess.CompletedProcess:
+    def _comment(
+        self,
+        args: list[str],
+        *,
+        input_text: str | None = None,
+    ) -> subprocess.CompletedProcess:
         if self.comment_error:
             return self._fail()
+        body_file = self._flag(args, "--body-file")
+        used_stdin = body_file == "-"
+        body = (input_text or "") if used_stdin else (self._flag(args, "--body") or "")
         self.mutations.append({
             "kind": "comment",
             "repo": self._flag(args, "--repo"),
             "issue": int(args[2]),
-            "body": self._flag(args, "--body") or "",
+            "body": body,
+            "body_file": body_file,
+            "used_stdin": used_stdin,
+            "args": list(args),
         })
         return self._ok({"ok": True})
 
     def _edit(self, args: list[str]) -> subprocess.CompletedProcess:
+        if self.edit_error:
+            return self._fail()
         self.mutations.append({
             "kind": "edit",
             "repo": self._flag(args, "--repo"),
             "issue": int(args[2]),
             "add_labels": self._flag_all(args, "--add-label"),
             "remove_labels": self._flag_all(args, "--remove-label"),
+            "add_assignees": self._flag_all(args, "--add-assignee"),
         })
         return self._ok({"ok": True})
 
@@ -295,6 +324,57 @@ class ScanFilterTest(GateTestCase):
             {entry["issue"]: entry["reason"] for entry in report["skipped"]},
             {7: "stop_label:enhancement", 8: "stop_label:question"},
         )
+
+    def test_non_bug_labels_skip_issue(self) -> None:
+        non_bug = (
+            "type:epic",
+            "documentation",
+            "duplicate",
+            "invalid",
+            "wontfix",
+            "area:roadmap",
+        )
+        for index, label in enumerate(non_bug, start=40):
+            with self.subTest(label=label):
+                self.gh.issues.clear()
+                self.gh.add("rumap/rumap", make_issue(index, labels=[label]))
+                _, report = self.scan()
+                self.assertEqual(report["items"], [])
+                self.assertEqual(report["skipped"][0]["reason"], f"stop_label:{label}")
+
+    def test_wayfinder_prefix_label_skips_issue(self) -> None:
+        self.gh.add("rumap/rumap", make_issue(51, labels=["wayfinder:decision"]))
+        self.gh.add("rumap/rumap", make_issue(52, labels=["bug", "wayfinder:map"]))
+        _, report = self.scan()
+        self.assertEqual(report["items"], [])
+        self.assertEqual(
+            {entry["issue"]: entry["reason"] for entry in report["skipped"]},
+            {51: "stop_label:wayfinder:decision", 52: "stop_label:wayfinder:map"},
+        )
+
+    def test_spec_and_map_titles_skipped_without_bug_or_needs_triage(self) -> None:
+        self.gh.add("rumap/rumap", make_issue(61, title="Spec: onboarding flow"))
+        self.gh.add("rumap/rumap", make_issue(62, title="Map: Android v2 roadmap"))
+        self.gh.add("rumap/rumap", make_issue(63, title="  spec: lowercase prefix"))
+        _, report = self.scan()
+        self.assertEqual(report["items"], [])
+        self.assertEqual(
+            {entry["issue"]: entry["reason"] for entry in report["skipped"]},
+            {
+                61: "non_bug_title:spec",
+                62: "non_bug_title:map",
+                63: "non_bug_title:spec",
+            },
+        )
+
+    def test_spec_and_map_titles_allowed_with_bug_or_needs_triage_label(self) -> None:
+        self.gh.add("rumap/rumap", make_issue(64, title="Map: crash on zoom", labels=["bug"]))
+        self.gh.add(
+            "rumap/rumap",
+            make_issue(65, title="Spec: broken parser", labels=["status:needs-triage"]),
+        )
+        _, report = self.scan()
+        self.assertEqual(sorted(item["issue"] for item in report["items"]), [64, 65])
 
     def test_closed_issue_is_skipped(self) -> None:
         self.gh.add("rumap/rumap", make_issue(7, state="CLOSED"))
@@ -557,6 +637,112 @@ class IdempotencyTest(GateTestCase):
         self.assertIn("--paginate", api_calls[0])
         self.assertIn("--slurp", api_calls[0])
 
+    def test_benny_retriggers_over_needs_owner(self) -> None:
+        self.gh.add(
+            "rumap/rumap",
+            make_issue(
+                7,
+                labels=["bug", "status:needs-owner"],
+                comments=[
+                    make_comment(gate.MARKER, "2026-02-01T10:00:00Z"),
+                    make_comment("Логи:\npanic: nil\n/benny", "2026-02-02T10:00:00Z"),
+                ],
+            ),
+        )
+        _, report = self.scan()
+        self.assertEqual([item["issue"] for item in report["items"]], [7])
+        self.assertEqual(
+            report["items"][0]["retrigger_reason"],
+            "comment:/benny@2026-02-02T10:00:00Z",
+        )
+
+    def test_triage_retriggers_over_ready_for_agent(self) -> None:
+        self.gh.add(
+            "rumap/rumap",
+            make_issue(
+                7,
+                labels=["bug", "status:ready-for-agent"],
+                comments=[
+                    make_comment(gate.MARKER, "2026-02-01T10:00:00Z"),
+                    make_comment("/triage", "2026-02-02T10:00:00Z"),
+                ],
+            ),
+        )
+        _, report = self.scan()
+        self.assertEqual([item["issue"] for item in report["items"]], [7])
+        self.assertEqual(
+            report["items"][0]["retrigger_reason"],
+            "comment:/triage@2026-02-02T10:00:00Z",
+        )
+
+    def test_relabel_needs_triage_retriggers_over_post_triage_statuses(self) -> None:
+        for index, post_label in enumerate(("status:needs-owner", "status:ready-for-agent"), start=70):
+            with self.subTest(post_label=post_label):
+                self.gh.issues.clear()
+                self.gh.events.clear()
+                self.gh.add(
+                    "rumap/rumap",
+                    make_issue(
+                        index,
+                        labels=["bug", post_label, "status:needs-triage"],
+                        comments=[make_comment(gate.MARKER, "2026-02-01T10:00:00Z")],
+                    ),
+                )
+                self.gh.add_event("rumap/rumap", index, "status:needs-triage", "2026-02-04T10:00:00Z")
+                _, report = self.scan()
+                self.assertEqual([item["issue"] for item in report["items"]], [index])
+                self.assertEqual(
+                    report["items"][0]["retrigger_reason"],
+                    "label:status:needs-triage@2026-02-04T10:00:00Z",
+                )
+
+    def test_retrigger_does_not_override_hard_stop_labels_or_assignee(self) -> None:
+        self.gh.add(
+            "rumap/rumap",
+            make_issue(
+                71,
+                labels=["bug", "status:in-progress"],
+                comments=[
+                    make_comment(gate.MARKER, "2026-02-01T10:00:00Z"),
+                    make_comment("/benny", "2026-02-02T10:00:00Z"),
+                ],
+            ),
+        )
+        self.gh.add(
+            "rumap/rumap",
+            make_issue(
+                72,
+                labels=["bug", "status:needs-owner"],
+                assignees=["dev"],
+                comments=[
+                    make_comment(gate.MARKER, "2026-02-01T10:00:00Z"),
+                    make_comment("/benny", "2026-02-02T10:00:00Z"),
+                ],
+            ),
+        )
+        _, report = self.scan()
+        self.assertEqual(report["items"], [])
+        self.assertEqual(
+            {entry["issue"]: entry["reason"] for entry in report["skipped"]},
+            {71: "stop_label:status:in-progress", 72: "has_assignee"},
+        )
+
+    def test_stale_retrigger_does_not_override_post_triage_status(self) -> None:
+        self.gh.add(
+            "rumap/rumap",
+            make_issue(
+                73,
+                labels=["bug", "status:needs-owner"],
+                comments=[
+                    make_comment("/benny", "2026-01-10T10:00:00Z"),
+                    make_comment(gate.MARKER, "2026-02-01T10:00:00Z"),
+                ],
+            ),
+        )
+        _, report = self.scan()
+        self.assertEqual(report["items"], [])
+        self.assertEqual(report["skipped"][0]["reason"], "stop_label:status:needs-owner")
+
 
 class LockTest(GateTestCase):
     def eligible_issue(self, number: int = 7) -> None:
@@ -655,6 +841,42 @@ class LockTest(GateTestCase):
         self.assertEqual(results.count(True), 1)
         self.assertEqual(results.count(False), workers - 1)
 
+    def test_is_locked_dead_helper_removed(self) -> None:
+        self.assertFalse(hasattr(gate, "is_locked"))
+
+    def test_evaluate_issue_releases_lock_on_error(self) -> None:
+        raw = make_issue(7, labels=["bug"])
+        with mock.patch.object(gate, "collect_referenced_items", side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                gate.evaluate_issue("rumap/rumap", raw, take_lock=True, lock_dir=self.lock_dir)
+        self.assertEqual(self.lock_files(), [])
+
+    def test_cmd_scan_releases_acquired_locks_when_later_issue_fails(self) -> None:
+        self.gh.add("rumap/rumap", make_issue(7, labels=["bug"]))
+        self.gh.add("rumap/rumap", make_issue(8, labels=["bug"]))
+
+        calls = 0
+
+        def flaky_refs(repo: str, issue: dict) -> list[dict]:
+            nonlocal calls
+            calls += 1
+            if issue["number"] == 8:
+                raise RuntimeError("gh failed mid-scan")
+            return []
+
+        with mock.patch.object(gate, "collect_referenced_items", side_effect=flaky_refs):
+            with self.assertRaises(RuntimeError):
+                self.scan()
+        self.assertEqual(calls, 2)
+        self.assertEqual(self.lock_files(), [])
+
+    def test_cmd_inspect_releases_lock_when_count_active_fixers_fails(self) -> None:
+        self.gh.add("rumap/rumap", make_issue(7, labels=["bug"]))
+        self.gh.fail_on_call = lambda cmd: cmd[1:3] == ["issue", "list"]
+        with self.assertRaises(subprocess.CalledProcessError):
+            self.run_cli("inspect", "rumap/rumap", "7", "--lock", "--lock-dir", str(self.lock_dir))
+        self.assertEqual(self.lock_files(), [])
+
 
 class FixerSlotTest(GateTestCase):
     def add_fixer(self, repo: str, number: int) -> None:
@@ -728,6 +950,27 @@ class FixerSlotTest(GateTestCase):
             with contextlib.redirect_stderr(io.StringIO()):
                 gate.main(["scan", "--max-fixers", "3", "--repos", "rumap/rumap"])
         self.assertEqual(self.gh.calls, [])
+
+    def test_scan_reuses_open_issues_for_active_fixers_and_queries_only_remaining_repos(self) -> None:
+        self.gh.add("rumap/rumap", make_issue(7, labels=["bug"]))
+        self.add_fixer("rumap/rumap", 20)
+        self.add_fixer("rumap/rumap-core", 21)
+
+        self.scan(repos=("rumap/rumap", "rumap/rumap-android", "rumap/rumap-core"))
+        in_progress_calls = [
+            call for call in self.gh.calls
+            if call[1:3] == ["issue", "list"] and "--label" in call
+        ]
+        self.assertEqual(in_progress_calls, [])
+
+        self.gh.calls.clear()
+        self.scan(repos=("rumap/rumap",))
+        in_progress_repos = [
+            call[call.index("--repo") + 1]
+            for call in self.gh.calls
+            if call[1:3] == ["issue", "list"] and "--label" in call
+        ]
+        self.assertEqual(sorted(in_progress_repos), ["rumap/rumap-android", "rumap/rumap-core"])
 
 
 class ItemContextTest(GateTestCase):
@@ -810,14 +1053,18 @@ class ActTest(GateTestCase):
         code, report = self.act("--area", "area:ui", "--status", "status:ready-for-agent")
         self.assertEqual(code, 0)
         self.assertEqual(report["result"], "acted")
-        self.assertEqual(self.gh.mutations[0]["kind"], "comment")
-        body = self.gh.mutations[0]["body"]
-        self.assertIn(gate.MARKER, body)
-        self.assertTrue(body.endswith(gate.MARKER))
-        edit = self.gh.mutations[1]
+        edit = self.gh.mutations[0]
         self.assertEqual(edit["kind"], "edit")
         self.assertEqual(edit["add_labels"], ["area:ui", "status:ready-for-agent"])
         self.assertEqual(edit["remove_labels"], ["status:needs-triage"])
+        comment = self.gh.mutations[1]
+        self.assertEqual(comment["kind"], "comment")
+        self.assertTrue(comment["used_stdin"])
+        self.assertEqual(comment["body_file"], "-")
+        self.assertNotIn("--body", comment["args"])
+        body = comment["body"]
+        self.assertIn(gate.MARKER, body)
+        self.assertTrue(body.endswith(gate.MARKER))
         self.assertEqual(report["add_labels"], ["area:ui", "status:ready-for-agent"])
 
     def test_act_supports_multiple_areas_and_needs_owner(self) -> None:
@@ -831,7 +1078,7 @@ class ActTest(GateTestCase):
         )
         self.assertEqual(code, 0)
         self.assertEqual(
-            self.gh.mutations[1]["add_labels"],
+            self.gh.mutations[0]["add_labels"],
             ["area:android", "area:vpn", "status:needs-owner"],
         )
         self.assertIn("area:android", report["add_labels"])
@@ -840,14 +1087,107 @@ class ActTest(GateTestCase):
         self.body_file.write_text(f"Report\n\n{gate.MARKER}", encoding="utf-8")
         code, _ = self.act("--area", "area:core", "--status", "status:ready-for-agent")
         self.assertEqual(code, 0)
-        self.assertEqual(self.gh.mutations[0]["body"].count(gate.MARKER), 1)
+        self.assertEqual(self.gh.mutations[1]["body"].count(gate.MARKER), 1)
 
     def test_act_skips_removal_when_needs_triage_absent(self) -> None:
         self.gh.issues[("rumap/rumap", 7)] = make_issue(7, labels=["bug"])
         code, report = self.act("--area", "area:backend", "--status", "status:ready-for-agent")
         self.assertEqual(code, 0)
         self.assertEqual(report["remove_labels"], [])
-        self.assertEqual(self.gh.mutations[1]["remove_labels"], [])
+        self.assertEqual(self.gh.mutations[0]["remove_labels"], [])
+
+    def test_act_removes_opposite_status_label_on_transition(self) -> None:
+        self.gh.issues[("rumap/rumap", 7)] = make_issue(
+            7, labels=["bug", "status:needs-owner", "status:needs-triage"]
+        )
+        code, report = self.act("--area", "area:backend", "--status", "status:ready-for-agent")
+        self.assertEqual(code, 0)
+        self.assertEqual(report["add_labels"], ["area:backend", "status:ready-for-agent"])
+        self.assertEqual(report["remove_labels"], ["status:needs-triage", "status:needs-owner"])
+
+        self.gh.mutations.clear()
+        self.gh.issues[("rumap/rumap", 7)] = make_issue(
+            7, labels=["bug", "status:ready-for-agent"]
+        )
+        code, report = self.act("--area", "area:backend", "--status", "status:needs-owner")
+        self.assertEqual(code, 0)
+        self.assertEqual(report["add_labels"], ["area:backend", "status:needs-owner"])
+        self.assertEqual(report["remove_labels"], ["status:ready-for-agent"])
+
+    def test_act_does_not_post_comment_and_releases_lock_when_edit_fails(self) -> None:
+        gate.acquire_lock(self.lock_dir, "rumap/rumap", 7)
+        self.gh.edit_error = True
+        with self.assertRaises(subprocess.CalledProcessError):
+            self.act("--area", "area:ui", "--status", "status:ready-for-agent")
+        self.assertEqual(self.gh.mutations, [])
+        self.assertEqual(self.lock_files(), [])
+
+    def test_act_claim_autofix_sets_in_progress_and_assignee_when_slot_available(self) -> None:
+        self.gh.issues[("rumap/rumap", 7)] = make_issue(
+            7, labels=["bug", "status:needs-triage", "status:needs-owner"]
+        )
+        code, report = self.act(
+            "--area",
+            "area:backend",
+            "--status",
+            "status:ready-for-agent",
+            "--claim-autofix",
+        )
+        self.assertEqual(code, 0)
+        self.assertTrue(report["autofix_claimed"])
+        self.assertEqual(report["add_labels"], ["area:backend", "status:in-progress"])
+        self.assertEqual(report["remove_labels"], ["status:needs-triage", "status:needs-owner"])
+        self.assertEqual(report["add_assignees"], ["@me"])
+        edit = self.gh.mutations[0]
+        self.assertEqual(edit["kind"], "edit")
+        self.assertEqual(edit["add_labels"], ["area:backend", "status:in-progress"])
+        self.assertEqual(edit["add_assignees"], ["@me"])
+        self.assertEqual(self.gh.mutations[1]["kind"], "comment")
+
+    def test_act_claim_autofix_falls_back_when_slots_full(self) -> None:
+        self.gh.add("rumap/rumap-core", make_issue(20, labels=["bug", "status:in-progress"]))
+        self.gh.add("rumap/rumap-android", make_issue(21, labels=["bug", "status:in-progress"]))
+        code, report = self.act(
+            "--area",
+            "area:backend",
+            "--status",
+            "status:ready-for-agent",
+            "--claim-autofix",
+        )
+        self.assertEqual(code, 0)
+        self.assertFalse(report["autofix_claimed"])
+        self.assertEqual(report["claim_skipped_reason"], "max_fixers_reached")
+        self.assertEqual(report["add_labels"], ["area:backend", "status:ready-for-agent"])
+        self.assertEqual(report["add_assignees"], [])
+        self.assertEqual(self.gh.mutations[0]["add_assignees"], [])
+
+    def test_act_claim_autofix_rejects_needs_owner(self) -> None:
+        code, report = self.act(
+            "--area",
+            "area:backend",
+            "--status",
+            "status:needs-owner",
+            "--claim-autofix",
+        )
+        self.assertEqual(code, 2)
+        self.assertEqual(report["error"], "claim_autofix_requires_ready_for_agent")
+        self.assertEqual(self.gh.mutations, [])
+
+    def test_act_claim_autofix_dry_run_plans_without_mutating(self) -> None:
+        code, report = self.act(
+            "--area",
+            "area:backend",
+            "--status",
+            "status:ready-for-agent",
+            "--claim-autofix",
+            "--dry-run",
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(report["result"], "dry_run")
+        self.assertTrue(report["autofix_claimed"])
+        self.assertEqual(report["add_labels"], ["area:backend", "status:in-progress"])
+        self.assertEqual(report["add_assignees"], ["@me"])
+        self.assertEqual(self.gh.mutations, [])
 
     def test_act_supports_extra_remove_label_present_on_issue(self) -> None:
         self.gh.issues[("rumap/rumap", 7)] = make_issue(

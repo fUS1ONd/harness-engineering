@@ -21,17 +21,28 @@ MARKER_RE = re.compile(r"<!--\s*benny-triage\s*-->")
 
 AREA_LABELS = ("area:ui", "area:android", "area:backend", "area:core", "area:vpn")
 TARGET_STATUS_LABELS = ("status:ready-for-agent", "status:needs-owner")
-STOP_LABELS = {
-    "status:ready-for-agent",
-    "status:in-progress",
-    "status:needs-owner",
-    "status:blocked",
-    "status:review",
-    "contributor",
-    "human-only",
+BUG_OPT_IN_LABELS = {"bug", "status:needs-triage"}
+NON_BUG_LABELS = {
     "enhancement",
     "question",
+    "type:epic",
+    "documentation",
+    "duplicate",
+    "invalid",
+    "wontfix",
+    "area:roadmap",
 }
+NON_BUG_LABEL_PREFIXES = ("wayfinder:",)
+NON_BUG_TITLE_RE = re.compile(r"^\s*(spec|map)\s*:", re.IGNORECASE)
+HARD_STOP_LABELS = {
+    "status:in-progress",
+    "status:review",
+    "status:blocked",
+    "contributor",
+    "human-only",
+} | NON_BUG_LABELS
+POST_TRIAGE_STATUS_LABELS = set(TARGET_STATUS_LABELS)
+STOP_LABELS = HARD_STOP_LABELS | POST_TRIAGE_STATUS_LABELS
 
 RETRIGGER_CMD_RE = re.compile(r"^\s*/(?:benny|triage)\b", re.IGNORECASE | re.MULTILINE)
 ISSUE_HASH_RE = re.compile(r"(?<!\w)#(\d+)\b")
@@ -49,8 +60,19 @@ NEEDS_TRIAGE_LABEL = "status:needs-triage"
 IN_PROGRESS_LABEL = "status:in-progress"
 
 
-def run(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, text=True, capture_output=True, check=check)
+def run(
+    cmd: list[str],
+    check: bool = True,
+    *,
+    input_text: str | None = None,
+) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        cmd,
+        text=True,
+        input=input_text,
+        capture_output=True,
+        check=check,
+    )
 
 
 def gh_json(args: list[str]) -> dict | list:
@@ -169,10 +191,28 @@ def fetch_issue(repo: str, number: int) -> dict:
     return normalize_issue(fetch_issue_raw(repo, number))
 
 
-def stop_reason(issue: dict) -> str | None:
+def hard_stop_reason(issue: dict) -> str | None:
     if issue["assignees"]:
         return "has_assignee"
-    matched = sorted(set(issue["labels"]) & STOP_LABELS)
+    labels = issue["labels"]
+    matched = sorted(
+        {
+            label
+            for label in labels
+            if label in HARD_STOP_LABELS or label.startswith(NON_BUG_LABEL_PREFIXES)
+        }
+    )
+    if matched:
+        return f"stop_label:{matched[0]}"
+    if not (set(labels) & BUG_OPT_IN_LABELS):
+        title_match = NON_BUG_TITLE_RE.match(issue["title"])
+        if title_match:
+            return f"non_bug_title:{title_match.group(1).lower()}"
+    return None
+
+
+def post_triage_stop_reason(issue: dict) -> str | None:
+    matched = sorted(set(issue["labels"]) & POST_TRIAGE_STATUS_LABELS)
     if matched:
         return f"stop_label:{matched[0]}"
     return None
@@ -236,8 +276,6 @@ def label_retrigger(repo: str, issue: dict, since_ts: str | None) -> dict | None
 def retrigger_reason(
     repo: str, issue: dict, marker_ts: str | None
 ) -> tuple[str | None, dict | None]:
-    if marker_ts is None:
-        return None, None
     comment = comment_retrigger(issue, marker_ts)
     if comment:
         return f"comment:{comment['command']}@{comment['createdAt']}", comment
@@ -344,15 +382,6 @@ def _lock_guard(lock_dir: Path | str, repo: str, issue_number: int):
             os.close(fd)
 
 
-def is_locked(lock_dir: Path | str, repo: str, issue_number: int) -> bool:
-    path = lock_path_for(lock_dir, repo, issue_number)
-    try:
-        st = path.stat()
-    except FileNotFoundError:
-        return False
-    return (time.time() - st.st_mtime) <= LOCK_TTL_SECONDS
-
-
 def acquire_lock(lock_dir: Path | str, repo: str, issue_number: int) -> bool:
     path = lock_path_for(lock_dir, repo, issue_number)
     with _lock_guard(lock_dir, repo, issue_number):
@@ -430,17 +459,34 @@ def evaluate_issue(
     if issue["state"].upper() != "OPEN":
         return {**base, "action": "skip", "reason": f"state={issue['state']}"}
 
-    reason = stop_reason(issue)
+    reason = hard_stop_reason(issue)
     if reason:
         return {**base, "action": "skip", "reason": reason}
 
+    post_triage = post_triage_stop_reason(issue)
     marker_ts = last_marker_created_at(issue)
-    retrigger, retrigger_info = retrigger_reason(repo, issue, marker_ts)
-    if marker_ts is not None and retrigger is None:
-        return {**base, "action": "skip", "reason": "already_triaged"}
+    retrigger: str | None = None
+    retrigger_info: dict | None = None
+    if marker_ts is not None or post_triage is not None:
+        retrigger, retrigger_info = retrigger_reason(repo, issue, marker_ts)
+    if retrigger is None:
+        if post_triage is not None:
+            return {**base, "action": "skip", "reason": post_triage}
+        if marker_ts is not None:
+            return {**base, "action": "skip", "reason": "already_triaged"}
 
-    if take_lock and not acquire_lock(lock_dir, repo, issue["number"]):
-        return {**base, "action": "skip", "reason": "triage_in_progress_locked"}
+    locked = False
+    if take_lock:
+        if not acquire_lock(lock_dir, repo, issue["number"]):
+            return {**base, "action": "skip", "reason": "triage_in_progress_locked"}
+        locked = True
+
+    try:
+        referenced_items = collect_referenced_items(repo, issue)
+    except Exception:
+        if locked:
+            release_lock(lock_dir, repo, issue["number"])
+        raise
 
     return {
         **base,
@@ -451,7 +497,7 @@ def evaluate_issue(
         "body": issue["body"],
         "labels": issue["labels"],
         "comments": issue["comments"],
-        "referenced_items": collect_referenced_items(repo, issue),
+        "referenced_items": referenced_items,
         "local_repo_path": LOCAL_REPOS[repo],
         "retrigger_reason": retrigger,
         "retrigger": retrigger_info,
@@ -508,7 +554,7 @@ def emit_error(message: str) -> int:
 
 
 def cmd_scan(args: argparse.Namespace) -> int:
-    repos = args.repos or list(LOCAL_REPOS.keys())
+    repos = list(dict.fromkeys(args.repos or list(LOCAL_REPOS.keys())))
     error = validate_repos(repos)
     if error:
         return emit_error(error)
@@ -516,24 +562,40 @@ def cmd_scan(args: argparse.Namespace) -> int:
     lock_dir = resolve_lock_dir(args.lock_dir)
     max_fixers = resolve_max_fixers(args.max_fixers)
 
-    active_fixers = count_active_fixers(list(LOCAL_REPOS.keys()))
+    open_issues_by_repo: dict[str, list[dict]] = {}
+    scanned_active_fixers = 0
+    for repo in repos:
+        issues = [raw for raw in list_open_issues(repo) if not is_pull_request(raw)]
+        open_issues_by_repo[repo] = issues
+        scanned_active_fixers += sum(
+            1 for raw in issues if IN_PROGRESS_LABEL in label_names(raw.get("labels"))
+        )
+
+    remaining_repos = [repo for repo in LOCAL_REPOS if repo not in open_issues_by_repo]
+    active_fixers = scanned_active_fixers + count_active_fixers(remaining_repos)
 
     items: list[dict] = []
     skipped: list[dict] = []
-    for repo in repos:
-        for raw_issue in list_open_issues(repo):
-            if is_pull_request(raw_issue):
-                continue
-            info = evaluate_issue(
-                repo,
-                raw_issue,
-                take_lock=args.lock,
-                lock_dir=lock_dir,
-            )
-            if info["action"] == "skip":
-                skipped.append(info)
-            else:
-                items.append(with_concurrency(info, active_fixers, max_fixers))
+    acquired_locks: list[tuple[str, int]] = []
+    try:
+        for repo, open_issues in open_issues_by_repo.items():
+            for raw_issue in open_issues:
+                info = evaluate_issue(
+                    repo,
+                    raw_issue,
+                    take_lock=args.lock,
+                    lock_dir=lock_dir,
+                )
+                if info["action"] == "skip":
+                    skipped.append(info)
+                else:
+                    if args.lock:
+                        acquired_locks.append((repo, info["issue"]))
+                    items.append(with_concurrency(info, active_fixers, max_fixers))
+    except Exception:
+        for locked_repo, locked_issue in acquired_locks:
+            release_lock(lock_dir, locked_repo, locked_issue)
+        raise
 
     return emit({
         "items": items,
@@ -559,8 +621,13 @@ def cmd_inspect(args: argparse.Namespace) -> int:
     if info["action"] == "skip":
         return emit(info)
 
-    active_fixers = count_active_fixers(list(LOCAL_REPOS.keys()))
-    return emit(with_concurrency(info, active_fixers, max_fixers))
+    try:
+        active_fixers = count_active_fixers(list(LOCAL_REPOS.keys()))
+        return emit(with_concurrency(info, active_fixers, max_fixers))
+    except Exception:
+        if args.lock:
+            release_lock(lock_dir, args.repo, args.issue)
+        raise
 
 
 def plan_comment_body(raw_body: str) -> str:
@@ -587,19 +654,53 @@ def cmd_act(args: argparse.Namespace) -> int:
     if not areas:
         return emit_error("area_label_required")
 
+    if args.claim_autofix and args.status != "status:ready-for-agent":
+        return emit_error("claim_autofix_requires_ready_for_agent")
+
     if not args.body_file or not Path(args.body_file).is_file():
         return emit_error(f"body_file_not_found:{args.body_file}")
 
     comment_body = plan_comment_body(Path(args.body_file).read_text(encoding="utf-8"))
-    add_labels = [*areas, args.status]
+    max_fixers = resolve_max_fixers(args.max_fixers)
 
     try:
-        current_labels = fetch_issue(args.repo, args.issue)["labels"]
-        requested_removals = [NEEDS_TRIAGE_LABEL, *args.remove_label]
+        current_issue = fetch_issue(args.repo, args.issue)
+        current_labels = current_issue["labels"]
+
+        autofix_claimed = False
+        claim_skipped_reason: str | None = None
+        effective_status = args.status
+        add_assignees: list[str] = []
+        active_fixers: int | None = None
+
+        if args.claim_autofix:
+            active_fixers = count_active_fixers(list(LOCAL_REPOS.keys()))
+            if current_issue["assignees"] or IN_PROGRESS_LABEL in current_labels:
+                claim_skipped_reason = "already_claimed"
+            elif active_fixers < max_fixers:
+                autofix_claimed = True
+                effective_status = IN_PROGRESS_LABEL
+                add_assignees = ["@me"]
+            else:
+                claim_skipped_reason = "max_fixers_reached"
+
+        add_labels = [*areas, effective_status]
+        requested_removals = [NEEDS_TRIAGE_LABEL, *TARGET_STATUS_LABELS, *args.remove_label]
         remove_labels: list[str] = []
         for label in requested_removals:
             if label in current_labels and label not in add_labels and label not in remove_labels:
                 remove_labels.append(label)
+
+        claim_fields: dict = {}
+        if args.claim_autofix:
+            claim_fields = {
+                "autofix_claimed": autofix_claimed,
+                "active_fixers": active_fixers,
+                "max_fixers": max_fixers,
+                "add_assignees": add_assignees,
+            }
+            if claim_skipped_reason is not None:
+                claim_fields["claim_skipped_reason"] = claim_skipped_reason
 
         if args.dry_run:
             return emit({
@@ -610,25 +711,32 @@ def cmd_act(args: argparse.Namespace) -> int:
                 "remove_labels": remove_labels,
                 "comment_body": comment_body,
                 "would_release_lock": True,
+                **claim_fields,
             })
 
-        run([
-            "gh",
-            "issue",
-            "comment",
-            str(args.issue),
-            "--repo",
-            args.repo,
-            "--body",
-            comment_body,
-        ])
-        if add_labels or remove_labels:
+        if add_labels or remove_labels or add_assignees:
             edit_cmd = ["gh", "issue", "edit", str(args.issue), "--repo", args.repo]
             for label in add_labels:
                 edit_cmd.extend(["--add-label", label])
             for label in remove_labels:
                 edit_cmd.extend(["--remove-label", label])
+            for assignee in add_assignees:
+                edit_cmd.extend(["--add-assignee", assignee])
             run(edit_cmd)
+
+        run(
+            [
+                "gh",
+                "issue",
+                "comment",
+                str(args.issue),
+                "--repo",
+                args.repo,
+                "--body-file",
+                "-",
+            ],
+            input_text=comment_body,
+        )
 
         return emit({
             "result": "acted",
@@ -638,6 +746,7 @@ def cmd_act(args: argparse.Namespace) -> int:
             "add_labels": add_labels,
             "remove_labels": remove_labels,
             "released_lock": True,
+            **claim_fields,
         })
     finally:
         if not args.dry_run:
@@ -670,6 +779,8 @@ def main(argv: list[str] | None = None) -> int:
     p_act.add_argument("--area", action="append", required=True)
     p_act.add_argument("--status", choices=TARGET_STATUS_LABELS, required=True)
     p_act.add_argument("--remove-label", action="append", default=[])
+    p_act.add_argument("--claim-autofix", action="store_true")
+    p_act.add_argument("--max-fixers", type=max_fixers_argument, default=None)
     p_act.add_argument("--dry-run", action="store_true")
     p_act.add_argument("--lock-dir")
     p_act.set_defaults(func=cmd_act)
