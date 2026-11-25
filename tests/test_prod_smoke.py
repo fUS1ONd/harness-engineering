@@ -348,6 +348,60 @@ class HealthAndHeartbeatTest(unittest.TestCase):
         metric = next(f for f in report.failures if f.kind == "metrics")
         self.assertIn("role=\"control\"", metric.detail)
 
+    def test_worker_online_nan_fails(self) -> None:
+        fake = healthy_fake()
+        fake.http[("rumap-center", CENTER_METRICS)] = HttpResult(
+            CENTER_METRICS,
+            200,
+            'rumap_blockcheck_worker_online{role="control"} NaN\n'
+            'rumap_blockcheck_worker_online{role="ru"} 1\n',
+            "",
+        )
+
+        report = run_smoke("worker", fake, window_seconds=300, now=lambda: NOW)
+
+        self.assertFalse(report.ok)
+        metric = next(f for f in report.failures if f.kind == "metrics")
+        self.assertIn('role="control"', metric.detail)
+
+    def test_metric_trailing_whitespace_does_not_crash(self) -> None:
+        fake = healthy_fake()
+        fake.http[("rumap-center", CENTER_METRICS)] = HttpResult(
+            CENTER_METRICS,
+            200,
+            'rumap_blockcheck_worker_online{role="control"}   \n'
+            'rumap_blockcheck_worker_online{role="ru"} 1\n',
+            "",
+        )
+
+        report = run_smoke("worker", fake, window_seconds=300, now=lambda: NOW)
+
+        self.assertFalse(report.ok)
+        metric = next(f for f in report.failures if f.kind == "metrics")
+        self.assertIn('role="control"', metric.detail)
+
+    def test_unit_timestamp_zero_and_bad_restarts_fail(self) -> None:
+        fake = healthy_fake()
+        fake.units[("rumap-center", "rumap-center-socks.service")] = ExecResult(
+            ("systemctl", "show"),
+            0,
+            "ActiveState=active\nSubState=running\nActiveEnterTimestamp=@0\nNRestarts=0\n",
+            "",
+        )
+        report_zero = run_smoke("center", fake, window_seconds=300, now=lambda: NOW)
+        self.assertFalse(report_zero.ok)
+        self.assertIn("unit_restarts", failure_kinds(report_zero))
+
+        fake.units[("rumap-center", "rumap-center-socks.service")] = ExecResult(
+            ("systemctl", "show"),
+            0,
+            f"ActiveState=active\nSubState=running\nActiveEnterTimestamp={OLD_UNIT_START}\nNRestarts=bad\n",
+            "",
+        )
+        report_bad = run_smoke("center", fake, window_seconds=300, now=lambda: NOW)
+        self.assertFalse(report_bad.ok)
+        self.assertIn("unit_restarts", failure_kinds(report_bad))
+
 
 class CliTest(unittest.TestCase):
     def test_json_output_and_exit_zero(self) -> None:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from datetime import datetime, timezone
 from typing import Callable, Mapping, Sequence
@@ -15,6 +16,23 @@ ROLE_ORDER = ("center", "worker", "point")
 LOG_PATTERN = re.compile(r"(?i)\b(?:error|panic|fatal)\b")
 MAX_EVIDENCE_LINES = 5
 MAX_EVIDENCE_CHARS = 500
+
+
+class _CachedHttpTransport:
+    """Кэширует GET-ответы в пределах одного прогона, чтобы не бить по SSH-лимитам хоста."""
+
+    def __init__(self, inner: Transport) -> None:
+        self._inner = inner
+        self._http_cache: dict[tuple[str, str], HttpResult] = {}
+
+    def exec(self, host: str, argv: Sequence[str], timeout: float = 30.0):
+        return self._inner.exec(host, argv, timeout=timeout)
+
+    def http_get(self, host: str, url: str, timeout: float = 10.0) -> HttpResult:
+        key = (host, url)
+        if key not in self._http_cache:
+            self._http_cache[key] = self._inner.http_get(host, url, timeout=timeout)
+        return self._http_cache[key]
 
 
 def run_smoke(
@@ -33,12 +51,13 @@ def run_smoke(
     clock = now or (lambda: datetime.now(timezone.utc))
     topology = roles if roles is not None else default_roles()
     selected = ROLE_ORDER if role == "all" else (role,)
+    cached_transport = _CachedHttpTransport(transport)
 
     started_at = clock()
     reports = []
     for name in selected:
         nodes = tuple(
-            _run_node(spec, transport, window_seconds, clock) for spec in topology[name]
+            _run_node(spec, cached_transport, window_seconds, clock) for spec in topology[name]
         )
         reports.append(RoleReport(role=name, nodes=nodes))
     return SmokeReport(
@@ -197,26 +216,28 @@ def _unit_checks(
         unit_check = _pass("unit", unit, f"{active}/{sub}")
 
     entered = _parse_unit_timestamp(fields.get("ActiveEnterTimestamp", ""))
+    raw_restarts = fields.get("NRestarts", "0")
     try:
-        restarts_count = int(fields.get("NRestarts", "0"))
+        restarts_count = int(raw_restarts)
     except ValueError:
-        restarts_count = 0
-    if entered is None:
-        restarts = _fail("unit_restarts", unit, "время запуска не разобрано")
+        restarts = _fail("unit_restarts", unit, f"NRestarts не разобран: {raw_restarts!r}")
     else:
-        age = (clock() - entered).total_seconds()
-        if restarts_count > 0 and age <= window_seconds:
-            restarts = _fail(
-                "unit_restarts",
-                unit,
-                f"перезапуск в окне: NRestarts={restarts_count}, активен {_fmt_age(age)}",
-            )
+        if entered is None:
+            restarts = _fail("unit_restarts", unit, "время запуска не разобрано")
         else:
-            restarts = _pass(
-                "unit_restarts",
-                unit,
-                f"NRestarts={restarts_count}, активен {_fmt_age(age)}",
-            )
+            age = (clock() - entered).total_seconds()
+            if restarts_count > 0 and age <= window_seconds:
+                restarts = _fail(
+                    "unit_restarts",
+                    unit,
+                    f"перезапуск в окне: NRestarts={restarts_count}, активен {_fmt_age(age)}",
+                )
+            else:
+                restarts = _pass(
+                    "unit_restarts",
+                    unit,
+                    f"NRestarts={restarts_count}, активен {_fmt_age(age)}",
+                )
     return [unit_check, restarts]
 
 
@@ -307,7 +328,7 @@ def _metric_check(spec: NodeSpec, probe: MetricProbe, transport: Transport) -> C
     value = _metric_value(response.body, probe.series)
     if value is None:
         return _fail("metrics", probe.series, f"серия {probe.series} не найдена на {probe.url}")
-    if value < probe.min_value:
+    if math.isnan(value) or value < probe.min_value:
         return _fail(
             "metrics",
             probe.series,
@@ -355,9 +376,11 @@ def _metric_value(body: str, series: str) -> float | None:
         rest = line[len(series) :]
         if not rest or not rest[0].isspace():
             continue
-        token = rest.split()[0]
+        tokens = rest.split()
+        if not tokens:
+            continue
         try:
-            return float(token)
+            return float(tokens[0])
         except ValueError:
             return None
     return None
@@ -382,7 +405,10 @@ def _parse_unit_timestamp(raw: str) -> datetime | None:
         value = value[1:]
     if not value.isdigit():
         return None
-    return datetime.fromtimestamp(int(value), tz=timezone.utc)
+    ts = int(value)
+    if ts <= 0:
+        return None
+    return datetime.fromtimestamp(ts, tz=timezone.utc)
 
 
 def _fmt_age(seconds: float) -> str:

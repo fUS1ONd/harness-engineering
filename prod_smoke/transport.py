@@ -33,18 +33,34 @@ class Transport(Protocol):
 class SshTransport:
     """Read-only: только `ssh` с пакетным режимом и `curl` на удалённом хосте."""
 
-    def __init__(self, ssh: str = "ssh", connect_timeout: int = 8) -> None:
+    def __init__(
+        self,
+        ssh: str = "ssh",
+        connect_timeout: int = 8,
+        control_persist: int = 30,
+    ) -> None:
         self.ssh = ssh
         self.connect_timeout = connect_timeout
+        self.control_persist = control_persist
+        # Короткий путь в /tmp: лимит Unix-сокета Linux — 108 байт, длинный TMPDIR его переполняет.
+        self._control_path = "/tmp/prod-smoke-%C"
 
     def exec(self, host: str, argv: Sequence[str], timeout: float = 30.0) -> ExecResult:
         argv = tuple(argv)
+        # Мультиплексирование удерживает одно TCP-соединение на хост, чтобы не триггерить ufw limit 22/tcp.
         command = [
             self.ssh,
             "-o",
             "BatchMode=yes",
             "-o",
             f"ConnectTimeout={self.connect_timeout}",
+            "-o",
+            "ControlMaster=auto",
+            "-o",
+            f"ControlPath={self._control_path}",
+            "-o",
+            f"ControlPersist={self.control_persist}",
+            "--",
             host,
             shlex.join(argv),
         ]
@@ -64,6 +80,7 @@ class SshTransport:
             str(max(1, int(timeout))),
             "-w",
             "\n%{http_code}",
+            "--",
             url,
         )
         done = self.exec(host, argv, timeout=timeout + 5)
