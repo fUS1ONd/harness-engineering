@@ -470,6 +470,52 @@ class MatrixRunTests(unittest.TestCase):
         self.assertEqual(rep_ip["scenarios"]["manual-check"]["metrics"]["manual_wifi"], "off")
         self.assertIn(("profile", "soft", "off"), stand_ip.actions)
 
+    def test_manual_check_retaps_submit_when_first_tap_is_swallowed(self):
+        stand = FakeStand()
+        orig_command = stand.command
+        submit_taps = 0
+
+        def swallow_first_submit(argv, **kwargs):
+            nonlocal submit_taps
+            args = shlex.split(argv[-1])
+            if args[:2] == ["input", "tap"] and stand.elements.get(int(args[2])) == "Проверить":
+                submit_taps += 1
+                if submit_taps == 1:
+                    stand.actions.append(("tap", "Проверить"))
+                    return CommandResult(0, b"", b"")
+            return orig_command(argv, **kwargs)
+
+        stand.runner.run.side_effect = swallow_first_submit
+        report = self.run_matrix(stand, scenarios=["manual-check"])
+        scenario = report["scenarios"]["manual-check"]
+        self.assertEqual(scenario["status"], "pass", scenario)
+        self.assertEqual(scenario["metrics"]["manual_submit_retaps"], 1)
+        self.assertEqual(scenario["metrics"]["manual_result"]["class"], "Точечная")
+
+    def test_manual_check_retries_after_temporary_wallet_limit_warning(self):
+        stand = FakeStand()
+        orig_command = stand.command
+        submit_taps = 0
+
+        def wallet_limit_first_attempt(argv, **kwargs):
+            nonlocal submit_taps
+            args = shlex.split(argv[-1])
+            if args[:2] == ["input", "tap"] and stand.elements.get(int(args[2])) == "Проверить":
+                submit_taps += 1
+                if submit_taps == 1:
+                    stand.actions.append(("tap", "Проверить"))
+                    stand.manual_error = "Достигнут временный лимит проверок — повторите попытку позже."
+                    return CommandResult(0, b"", b"")
+                stand.manual_error = None
+            return orig_command(argv, **kwargs)
+
+        stand.runner.run.side_effect = wallet_limit_first_attempt
+        report = self.run_matrix(stand, scenarios=["manual-check"])
+        scenario = report["scenarios"]["manual-check"]
+        self.assertEqual(scenario["status"], "pass", scenario)
+        self.assertEqual(scenario["metrics"]["manual_attempts"], 2)
+        self.assertEqual(scenario["metrics"]["manual_result"]["class"], "Точечная")
+
     def test_koala_excluded_recovers_from_transient_cellular_unavailable(self):
         stand = FakeStand()
         original_apply = stand.apply_profile

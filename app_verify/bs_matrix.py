@@ -37,8 +37,13 @@ MANUAL_ERRORS = (
     "наблюдение не запущено",
     "Не удалось запустить ручную проверку",
     "резолв доменов разрешён только через честный Wi-Fi",
+    "Достигнут временный лимит проверок",
 )
 MANUAL_ATTEMPTS = 3
+MANUAL_IN_PROGRESS_LABELS = ("Проверяем…", "Отменить")
+MANUAL_IN_PROGRESS_TIMEOUT_S = 270.0
+MANUAL_RETAP_INTERVAL_S = 6.0
+MANUAL_MAX_SUBMIT_TAPS = 3
 START = "Запустить"
 STOP_CALIBRATION = "Остановить"
 NUDGE_INTERVAL_S = 20.0
@@ -417,8 +422,7 @@ class Matrix:
         tree = self.screen()
         return self.ui_element(tree, RECHECK) is None and self.ui_element(tree, "Проверить") is not None
 
-    def manual_outcome(self) -> tuple[str, str] | None:
-        tree = self.screen()
+    def manual_outcome_from_tree(self, tree: str) -> tuple[str, str] | None:
         if f'text="{self.manual_target}"' in tree:
             label = next((label for label in MANUAL_CLASSES if f'text="{label}"' in tree), None)
             if label:
@@ -428,6 +432,41 @@ class Matrix:
             match = re.search(r'text=("(?:[^"\\]|\\.)*")', error)
             return "error", json.loads(match.group(1)) if match else error
         return None
+
+    def manual_outcome(self) -> tuple[str, str] | None:
+        return self.manual_outcome_from_tree(self.screen())
+
+    def wait_manual_outcome(self) -> tuple[str, str]:
+        base_timeout = self.phase_timeout
+        progress_timeout = max(base_timeout, MANUAL_IN_PROGRESS_TIMEOUT_S) if base_timeout >= 30 else base_timeout
+        retap_interval = min(MANUAL_RETAP_INTERVAL_S, base_timeout / 3)
+        started_at = time.monotonic()
+        last_tap_at = started_at
+        submit_taps = 1
+        seen_progress = False
+        while True:
+            tree = self.screen()
+            outcome = self.manual_outcome_from_tree(tree)
+            if outcome is not None:
+                return outcome
+            if any(f'text="{label}"' in tree for label in MANUAL_IN_PROGRESS_LABELS):
+                seen_progress = True
+            now = time.monotonic()
+            deadline = started_at + (progress_timeout if seen_progress else base_timeout)
+            if now >= deadline:
+                raise StandError(f"Нет завершённого результата ручной проверки {self.manual_target}")
+            if not seen_progress and submit_taps < MANUAL_MAX_SUBMIT_TAPS and now - last_tap_at >= retap_interval:
+                position = self.ui_element(tree, "Проверить")
+                if position is not None:
+                    self.tap_at(position)
+                    submit_taps += 1
+                    last_tap_at = time.monotonic()
+                    self.metrics["manual_submit_retaps"] = self.metrics.get("manual_submit_retaps", 0) + 1
+            remaining = max(0.0, deadline - time.monotonic())
+            step = min(2.0, remaining)
+            if not seen_progress and submit_taps < MANUAL_MAX_SUBMIT_TAPS:
+                step = min(step, max(0.0, retap_interval - (time.monotonic() - last_tap_at)))
+            time.sleep(step)
 
     def stop_calibration_if_running(self) -> bool:
         """Останавливает фоновую автокалибровку, если она временно поставила orchestrator на паузу."""
@@ -466,17 +505,18 @@ class Matrix:
             self.tap("Проверить")
             if attempt > 1:
                 time.sleep(min(1.0, self.phase_timeout))
-            kind, value = self.wait(self.manual_outcome, f"Нет завершённого результата ручной проверки {self.manual_target}")
+            kind, value = self.wait_manual_outcome()
             if kind == "result":
                 self.metrics["manual_result"] = {"target": self.manual_target, "class": value}
                 return
             errors.append({"attempt": attempt, "error": value, "diag_tail": self.diag_tail()})
             self.metrics["manual_errors"] = errors
             if attempt < MANUAL_ATTEMPTS:
-                before = self.cursor()
-                if "наблюдение не запущено" in value:
-                    self.stop_calibration_if_running()
-                self.phase("SOFT", before, nudge=True)
+                if "Достигнут временный лимит проверок" not in value:
+                    before = self.cursor()
+                    if "наблюдение не запущено" in value:
+                        self.stop_calibration_if_running()
+                    self.phase("SOFT", before, nudge=True)
         raise StandError(f"Ручная проверка {self.manual_target} вернула ошибку: {errors[-1]['error']}")
 
     def subscription(self) -> str:
