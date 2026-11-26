@@ -319,6 +319,19 @@ class ParseConnectivityTests(unittest.TestCase):
         self.assertTrue(snapshot.cellular_connected)
         self.assertEqual(snapshot.cell_interface, "radio0")
 
+    def test_parse_connectivity_extracts_vpn_owner_uid(self) -> None:
+        vpn_with_uid = (
+            "  NetworkAgentInfo{network{103} lp{{InterfaceName: tun0}} "
+            "nc{[ Transports: VPN Capabilities: INTERNET OwnerUid: 10192 ]}}\n"
+        )
+        self.assertEqual(parse_connectivity(_connectivity(CELL_BLOCK, vpn_with_uid)).vpn_owner_uid, 10192)
+        self.assertIsNone(parse_connectivity(CELL_WIFI_VPN).vpn_owner_uid)
+        vpn_invalid_uid = (
+            "  NetworkAgentInfo{network{103} lp{{InterfaceName: tun0}} "
+            "nc{[ Transports: VPN Capabilities: INTERNET OwnerUid: -1 ]}}\n"
+        )
+        self.assertIsNone(parse_connectivity(_connectivity(CELL_BLOCK, vpn_invalid_uid)).vpn_owner_uid)
+
 
 class CellInterfaceValidationTests(unittest.TestCase):
     def test_rejects_loopback_wifi_and_vpn_interfaces(self) -> None:
@@ -659,6 +672,42 @@ class StatusTests(unittest.TestCase):
         ):
             self.assertIn(key, payload)
 
+    def test_status_reports_custom_for_leftover_staging_chain_or_output_jump(self) -> None:
+        fake_staging = _FakeAdb()
+        fake_staging.chains[STAGING_CHAIN] = [["-p", "tcp", "--dport", "443", "-j", "DROP"]]
+        st_staging = _client(fake_staging).status()
+        self.assertEqual(st_staging.profile, "custom")
+        self.assertTrue(st_staging.rules)
+
+        fake_jump = _FakeAdb(output_rules=[["-o", "rmnet_data0", "-j", CHAIN_NAME]])
+        self.assertEqual(_client(fake_jump).status().profile, "custom")
+
+        fake_mixed = _FakeAdb(
+            chain_rules=build_profile_rules("soft"),
+            output_rules=[
+                ["-o", "rmnet_data0", "-j", CHAIN_NAME],
+                ["-o", "rmnet_data0", "-j", STAGING_CHAIN],
+            ],
+        )
+        self.assertEqual(_client(fake_mixed).status().profile, "custom")
+
+    def test_status_raises_stand_error_on_xtables_lock_code_4(self) -> None:
+        fake = _FakeAdb()
+        orig_iptables = fake._iptables_command
+
+        def lock_error(argv: list[str]) -> CommandResult:
+            if argv == ["-S", CHAIN_NAME]:
+                return CommandResult(
+                    returncode=4,
+                    stdout=b"",
+                    stderr=b"Another app is currently holding the xtables lock.",
+                )
+            return orig_iptables(argv)
+
+        fake._iptables_command = lock_error  # type: ignore[method-assign]
+        with self.assertRaisesRegex(StandError, "код 4"):
+            _client(fake).status()
+
 
 class ResetTests(unittest.TestCase):
     def test_reset_removes_chain_and_enables_wifi(self) -> None:
@@ -707,6 +756,33 @@ class ResetTests(unittest.TestCase):
             ],
         )
         self.assertTrue(all(call[:2] == ["-w", "5"] for call in fake.iptables_calls))
+
+    def test_reset_raises_stand_error_when_chain_or_jump_survives_cleanup(self) -> None:
+        fake = _FakeAdb(
+            chain_rules=build_profile_rules("soft"),
+            output_rules=[["-o", "rmnet_data0", "-j", CHAIN_NAME]],
+            wifi_on=False,
+        )
+        orig_iptables = fake._iptables_command
+
+        def block_delete(argv: list[str]) -> CommandResult:
+            if argv[:2] == ["-D", "OUTPUT"] or argv[:1] == ["-X"]:
+                return CommandResult(returncode=4, stdout=b"", stderr=b"xtables lock")
+            return orig_iptables(argv)
+
+        fake._iptables_command = block_delete  # type: ignore[method-assign]
+        with self.assertRaisesRegex(StandError, "остались"):
+            _client(fake).reset()
+
+    def test_reset_raises_stand_error_when_post_reset_status_is_not_off(self) -> None:
+        fake = _FakeAdb(wifi_on=False)
+        client = _client(fake)
+        reappeared_status = _client(
+            _FakeAdb(chain_rules=build_profile_rules("soft"))
+        ).status()
+        with mock.patch.object(client, "_collect_status", return_value=reappeared_status):
+            with self.assertRaisesRegex(StandError, "ожидался профиль 'off'"):
+                client.reset()
 
 
 class CliIntegrationTests(unittest.TestCase):

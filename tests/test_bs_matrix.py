@@ -3,6 +3,7 @@ import json
 import os
 import shlex
 import signal
+import subprocess
 import unittest
 from contextlib import ExitStack
 from pathlib import Path
@@ -15,7 +16,7 @@ from app_verify.bs_matrix import PACKAGE, SCENARIOS, run_bs_matrix
 from app_verify.cli import run_cli
 from app_verify.core import LogAnomaly, LogReport, StandError, StandStatus
 from app_verify.net_emulation import NetStatus
-from app_verify.remnawave import TemporarySubscription
+from app_verify.remnawave import TemporarySubscription, _config as remnawave_config
 from app_verify.vpn_clients import HappSigillError, VpnClientStatus
 
 
@@ -582,6 +583,26 @@ class MatrixRunTests(unittest.TestCase):
         self.assertEqual(scenario["metrics"]["cleared_conflicts"], ["CELLULAR_UNAVAILABLE"])
         self.assertEqual(scenario["metrics"]["network_conflict"], "NONE")
 
+    def test_doze_resume_leave_idle_failure_stops_remaining_scenarios(self):
+        stand = FakeStand()
+        orig_command = stand.command
+
+        def fail_unforce(argv, **kwargs):
+            args = shlex.split(argv[-1])
+            if args == ["dumpsys", "deviceidle", "unforce"]:
+                return CommandResult(1, b"", b"deviceidle unforce failed")
+            return orig_command(argv, **kwargs)
+
+        stand.runner.run.side_effect = fail_unforce
+        report = self.run_matrix(stand, scenarios=["doze-resume", "cold-start", "happ"])
+        self.assertEqual(report["verdict"], "fail")
+        self.assertEqual(report["scenarios"]["doze-resume"]["status"], "fail")
+        self.assertEqual(report["cleanup"]["after_doze_resume"]["status"], "fail")
+        self.assertEqual(report["scenarios"]["cold-start"]["status"], "skipped")
+        self.assertEqual(report["scenarios"]["cold-start"]["reason"], "Сценарий не запущен")
+        self.assertEqual(report["scenarios"]["happ"]["status"], "skipped")
+        self.assertEqual(report["scenarios"]["happ"]["reason"], "Сценарий не запущен")
+
 
 class SubscriptionTests(unittest.TestCase):
     def test_cleanup_looks_up_user_when_creation_response_was_lost(self):
@@ -594,6 +615,32 @@ class SubscriptionTests(unittest.TestCase):
                 subscription.create()
             self.assertTrue(subscription.delete()["deleted"])
         self.assertEqual(request.call_args_list[2].args, ("DELETE", "/api/users/test-uuid"))
+
+    def test_remnawave_config_wraps_read_oserror_in_stand_error(self):
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch("app_verify.remnawave.Path.read_text", side_effect=PermissionError("denied")),
+        ):
+            with self.assertRaises(StandError) as ctx:
+                remnawave_config()
+        self.assertIsNone(ctx.exception.__cause__)
+        self.assertTrue(ctx.exception.__suppress_context__)
+
+    def test_remnawave_config_wraps_ssh_errors_in_stand_error(self):
+        for exc in (
+            subprocess.TimeoutExpired(["ssh", "leaseweb-nl"], 10),
+            FileNotFoundError("ssh not found"),
+        ):
+            with (
+                self.subTest(exc=type(exc).__name__),
+                patch.dict(os.environ, {}, clear=True),
+                patch("app_verify.remnawave.Path.read_text", side_effect=FileNotFoundError),
+                patch("app_verify.remnawave.subprocess.run", side_effect=exc),
+            ):
+                with self.assertRaises(StandError) as ctx:
+                    remnawave_config()
+                self.assertIsNone(ctx.exception.__cause__)
+                self.assertTrue(ctx.exception.__suppress_context__)
 
 
 class RemnawaveUserFormatTests(unittest.TestCase):

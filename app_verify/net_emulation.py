@@ -48,6 +48,7 @@ _ICMP_ECHO_REQUEST_TYPES = frozenset({"echo-request", "8", "8/0"})
 _NETWORK_BLOCK_RE = re.compile(r"NetworkAgentInfo\s*\{")
 _TRANSPORTS_RE = re.compile(r"Transports:\s*([^\n\]]*)", re.IGNORECASE)
 _INTERFACE_RE_LINE = re.compile(r"InterfaceName:\s*([^\s,}\]]+)")
+_OWNER_UID_RE = re.compile(r"\bOwnerUid:\s*(\d+)\b")
 _TUN_RE = re.compile(r"\b(tun\d+)\b")
 
 
@@ -61,6 +62,7 @@ class ConnectivitySnapshot:
     wifi_interface: str | None = None
     vpn_active: bool = False
     vpn_interface: str | None = None
+    vpn_owner_uid: int | None = None
 
 
 @dataclass(frozen=True)
@@ -200,6 +202,7 @@ def parse_connectivity(text: str) -> ConnectivitySnapshot:
     wifi_interface: str | None = None
     vpn_active = False
     vpn_interface: str | None = None
+    vpn_owner_uid: int | None = None
 
     for segment in segments:
         transports = _transport_tokens(segment)
@@ -224,6 +227,10 @@ def parse_connectivity(text: str) -> ConnectivitySnapshot:
                     tun_match = _TUN_RE.search(segment)
                     if tun_match is not None:
                         vpn_interface = tun_match.group(1)
+            if vpn_owner_uid is None:
+                owner_match = _OWNER_UID_RE.search(segment)
+                if owner_match is not None:
+                    vpn_owner_uid = int(owner_match.group(1))
 
     return ConnectivitySnapshot(
         cell_interface=cell_interface,
@@ -232,6 +239,7 @@ def parse_connectivity(text: str) -> ConnectivitySnapshot:
         wifi_interface=wifi_interface,
         vpn_active=vpn_active,
         vpn_interface=vpn_interface,
+        vpn_owner_uid=vpn_owner_uid,
     )
 
 
@@ -360,6 +368,13 @@ def extract_allowed_ips(rule_lines: Sequence[str]) -> tuple[str, ...]:
     return tuple(result)
 
 
+def _is_missing_chain_error(result: CommandResult) -> bool:
+    if result.returncode != 1:
+        return False
+    combined = f"{result.stderr_text}\n{result.stdout_text}".lower()
+    return "no chain/target/match" in combined or "does not exist" in combined
+
+
 class NetEmulationClient:
     """Клиент `adb`/`iptables` для программной эмуляции БС на сотовом интерфейсе."""
 
@@ -426,22 +441,33 @@ class NetEmulationClient:
         snapshot = self._read_connectivity()
         return validate_cell_interface(snapshot.cell_interface)
 
-    def _read_chain_rules(self) -> tuple[str, ...]:
-        result = self._iptables("-S", CHAIN_NAME, check=False)
-        if result.returncode != 0:
-            return ()
-        return tuple(
-            line.strip()
-            for line in result.stdout_text.splitlines()
-            if line.strip().startswith("-A ")
+    def _read_chain_state(self, chain: str = CHAIN_NAME) -> tuple[bool, tuple[str, ...]]:
+        """Возвращает `(существует_ли_цепочка, правила)`, отличая отсутствие цепочки от ошибок iptables."""
+        result = self._iptables("-S", chain, check=False)
+        if result.returncode == 0:
+            rules = tuple(
+                line.strip()
+                for line in result.stdout_text.splitlines()
+                if line.strip().startswith("-A ")
+            )
+            return True, rules
+        if _is_missing_chain_error(result):
+            return False, ()
+        details = result.stderr_text.strip() or result.stdout_text.strip() or f"код {result.returncode}"
+        raise StandError(
+            f"`iptables -S {chain}` завершился с ошибкой (код {result.returncode}): {details}"
         )
 
-    def _output_jumps(self, chain: str) -> list[tuple[int, list[str]]]:
-        """Позиции (с 1) и аргументы правил `OUTPUT`, прыгающих в `chain`."""
-        output = self._iptables("-S", "OUTPUT", check=False)
-        if output.returncode != 0:
-            return []
-        jumps: list[tuple[int, list[str]]] = []
+    def _read_chain_rules(self, chain: str = CHAIN_NAME) -> tuple[str, ...]:
+        _, rules = self._read_chain_state(chain)
+        return rules
+
+    def _output_jumps_by_chain(
+        self, chains: Sequence[str]
+    ) -> dict[str, list[tuple[int, list[str]]]]:
+        targets = set(chains)
+        output = self._iptables("-S", "OUTPUT")
+        jumps: dict[str, list[tuple[int, list[str]]]] = {chain: [] for chain in chains}
         position = 0
         for line in output.stdout_text.splitlines():
             stripped = line.strip()
@@ -451,9 +477,14 @@ class NetEmulationClient:
             if tokens[:2] != ["-A", "OUTPUT"]:
                 continue
             position += 1
-            if _jump(tokens) == chain:
-                jumps.append((position, tokens[2:]))
+            target = _jump(tokens)
+            if target in targets:
+                jumps[target].append((position, tokens[2:]))
         return jumps
+
+    def _output_jumps(self, chain: str) -> list[tuple[int, list[str]]]:
+        """Позиции (с 1) и аргументы правил `OUTPUT`, прыгающих в `chain`."""
+        return self._output_jumps_by_chain((chain,))[chain]
 
     def _drop_chain(self, chain: str) -> None:
         """Идемпотентно снимает все ссылки `OUTPUT -> chain`, чистит и удаляет цепочку."""
@@ -465,6 +496,17 @@ class NetEmulationClient:
     def _cleanup_chain(self) -> None:
         self._drop_chain(STAGING_CHAIN)
         self._drop_chain(CHAIN_NAME)
+        managed = (STAGING_CHAIN, CHAIN_NAME)
+        remaining_jumps = self._output_jumps_by_chain(managed)
+        leftover_jumps = [chain for chain in managed if remaining_jumps[chain]]
+        leftover_chains = [chain for chain in managed if self._read_chain_state(chain)[0]]
+        if leftover_jumps or leftover_chains:
+            details: list[str] = []
+            if leftover_jumps:
+                details.append(f"остались прыжки OUTPUT -> {', '.join(leftover_jumps)}")
+            if leftover_chains:
+                details.append(f"остались цепочки {', '.join(leftover_chains)}")
+            raise StandError(f"Не удалось полностью очистить правила БС: {'; '.join(details)}")
 
     def _fill_chain(self, chain: str, rules: Sequence[Sequence[str]]) -> None:
         if self._iptables("-N", chain, check=False).returncode != 0:
@@ -518,10 +560,18 @@ class NetEmulationClient:
         return snapshot.wifi_connected
 
     def _collect_status(self) -> NetStatus:
-        rules = self._read_chain_rules()
+        _, rules = self._read_chain_state(CHAIN_NAME)
+        staging_exists, staging_rules = self._read_chain_state(STAGING_CHAIN)
+        jumps = self._output_jumps_by_chain((CHAIN_NAME, STAGING_CHAIN))
+        profile = detect_profile(rules)
+        if staging_exists or staging_rules or jumps[STAGING_CHAIN]:
+            profile = "custom"
+        elif profile == "off" and jumps[CHAIN_NAME]:
+            profile = "custom"
+
         snapshot = self._read_connectivity()
         return NetStatus(
-            profile=detect_profile(rules),
+            profile=profile,
             allowed_ips=extract_allowed_ips(rules),
             cell_interface=snapshot.cell_interface,
             wifi_enabled=self._read_wifi_enabled(snapshot),
@@ -530,7 +580,7 @@ class NetEmulationClient:
             cellular_connected=snapshot.cellular_connected,
             vpn_active=snapshot.vpn_active,
             vpn_interface=snapshot.vpn_interface,
-            rules=rules,
+            rules=rules + staging_rules,
         )
 
     def apply_profile(
@@ -556,7 +606,12 @@ class NetEmulationClient:
             self._replace_chain(build_profile_rules(normalized, whitelist), cell_interface)
 
         self._apply_wifi(wifi_action)
-        return self._collect_status()
+        status = self._collect_status()
+        if normalized == "off" and status.profile != "off":
+            raise StandError(
+                f"После отключения БС ожидался профиль 'off', но фактически: {status.profile!r}"
+            )
+        return status
 
     def status(self) -> NetStatus:
         self._ensure_root()
@@ -566,4 +621,9 @@ class NetEmulationClient:
         self._ensure_root()
         self._cleanup_chain()
         self._apply_wifi("on")
-        return self._collect_status()
+        status = self._collect_status()
+        if status.profile != "off":
+            raise StandError(
+                f"После сброса БС ожидался профиль 'off', но фактически: {status.profile!r}"
+            )
+        return status

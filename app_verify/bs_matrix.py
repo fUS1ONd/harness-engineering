@@ -828,6 +828,9 @@ def run_bs_matrix(
             finally:
                 entry.update(metrics=matrix.metrics, elapsed_s=round(time.monotonic() - start, 2))
             matrix.collect_stability()
+            if phase == "doze-resume" and matrix.idle_forced:
+                if not cleanup("after_doze_resume", matrix.leave_idle):
+                    break
             if phase.startswith("koala-") or phase == "happ":
                 client = "koala" if phase.startswith("koala-") else "happ"
                 if not cleanup(f"after_{phase}", lambda: matrix.disconnect(client)):

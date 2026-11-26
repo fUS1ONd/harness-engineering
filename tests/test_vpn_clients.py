@@ -13,9 +13,10 @@ import unittest
 from typing import Any
 from unittest import mock
 
-from app_verify.android import CommandResult, HddInvariantError
+from app_verify.android import CommandResult, HddInvariantError, StandTimeoutError
 from app_verify.cli import run_cli
 from app_verify.core import StandError
+from app_verify.net_emulation import parse_connectivity
 from app_verify.vpn_clients import (
     DEFAULT_EXCLUDE_PACKAGE,
     HAPP_PACKAGE,
@@ -59,6 +60,15 @@ Current Networks:
     InterfaceName: wlan0
   }
   NetworkAgentInfo{network{103} lp{{InterfaceName: tun0 LinkAddresses: [ 172.19.0.1/30 ]}} nc{[ Transports: WIFI|VPN Capabilities: INTERNET&TRUSTED&VALIDATED TransportInfo: <VpnTransportInfo{type=1, sessionId=Clash}> Uids: <{0-10191, 10193-10193, 10195-99999}> OwnerUid: 10192 ]}
+  }
+"""
+
+CELL_WIFI_HAPP_VPN_ALL = """Active default network: 101
+Current Networks:
+  NetworkAgentInfo{network{101} nc{[ Transports: WIFI Capabilities: INTERNET&NOT_VPN ]}
+    InterfaceName: wlan0
+  }
+  NetworkAgentInfo{network{104} lp{{InterfaceName: tun0 LinkAddresses: [ 172.19.0.1/30 ]}} nc{[ Transports: WIFI|VPN Capabilities: INTERNET&TRUSTED&VALIDATED TransportInfo: <VpnTransportInfo{type=1, sessionId=Happ}> Uids: <{0-10192, 10194-99999}> OwnerUid: 10193 ]}
   }
 """
 
@@ -108,6 +118,7 @@ class _FakeVpnEnv:
         connectivity: str = CELL_WIFI_NO_VPN,
         device_abi: str = "x86_64",
         pkg_abis: dict[str, str] | None = None,
+        pkg_uids: dict[str, int] | None = None,
         koala_service_xml: str = "",
         happ_sigill_on_connect: bool = True,
         koala_ignore_stop_intent: bool = False,
@@ -121,6 +132,13 @@ class _FakeVpnEnv:
             or {
                 KOALA_PACKAGE: "x86_64",
                 HAPP_PACKAGE: "arm64-v8a",
+            }
+        )
+        self.pkg_uids: dict[str, int] = dict(
+            pkg_uids
+            or {
+                KOALA_PACKAGE: 10192,
+                HAPP_PACKAGE: 10193,
             }
         )
         self.appops: dict[str, dict[str, str]] = {}
@@ -234,7 +252,8 @@ class _FakeVpnEnv:
             if pkg not in self.installed:
                 return _fail(f"Unable to find package: {pkg}")
             abi = self.pkg_abis.get(pkg, "x86_64")
-            return _ok(f"Package [{pkg}]:\n    userId=10192\n    primaryCpuAbi={abi}\n")
+            uid = self.pkg_uids.get(pkg, 10192)
+            return _ok(f"Package [{pkg}]:\n    userId={uid}\n    primaryCpuAbi={abi}\n")
         if tokens == ["dumpsys", "connectivity"]:
             return _ok(self.connectivity)
         if tokens == ["ip", "link", "show", "tun0"]:
@@ -252,13 +271,20 @@ class _FakeVpnEnv:
         if tokens[:2] == ["logcat", "-d"]:
             return _ok(self.logcat_text)
         if tokens[:2] == ["am", "force-stop"] and len(tokens) == 3:
-            self.force_stops.append(tokens[2])
-            self._deactivate_vpn()
+            pkg = tokens[2]
+            self.force_stops.append(pkg)
+            owner_uid = parse_connectivity(self.connectivity).vpn_owner_uid
+            if owner_uid is None or owner_uid == self.pkg_uids.get(pkg):
+                self._deactivate_vpn()
             return _ok()
         if tokens[:2] == ["am", "broadcast"]:
             self.broadcasts.append(tokens)
             if "su.happ.proxyutility.action.widget.click" in tokens:
-                if self.tun0_up:
+                owner_uid = parse_connectivity(self.connectivity).vpn_owner_uid
+                happ_owns_tun = self.tun0_up and (
+                    owner_uid is None or owner_uid == self.pkg_uids.get(HAPP_PACKAGE)
+                )
+                if happ_owns_tun:
                     self._deactivate_vpn()
                 elif self.happ_sigill_on_connect:
                     self.logcat_text = (
@@ -267,7 +293,7 @@ class _FakeVpnEnv:
                     )
                 else:
                     self.tun0_up = True
-                    self.connectivity = CELL_WIFI_KOALA_VPN_ALL
+                    self.connectivity = CELL_WIFI_HAPP_VPN_ALL
             return _ok("Broadcast completed: result=0\n")
         if tokens[:2] == ["am", "start"]:
             self.started_intents.append(tokens)
@@ -457,6 +483,103 @@ class ImportSubscriptionTests(unittest.TestCase):
         with self.assertRaises(StandError):
             mgr.import_subscription("koala", url=None, env={})
         self.assertEqual(fake.calls, [])
+
+    def test_import_subscription_redacts_secret_url_on_am_start_timeout(self) -> None:
+        secret_url = "https://sub.example.test/very-secret-token?a=1&b=2"
+        encoded_url = "https%3A%2F%2Fsub.example.test%2Fvery-secret-token%3Fa%3D1%26b%3D2"
+        for client, pkg in (("koala", KOALA_PACKAGE), ("happ", HAPP_PACKAGE)):
+            with self.subTest(client=client):
+                fake = _FakeVpnEnv(installed={pkg})
+                orig_run = fake.run
+
+                def run_with_timeout(args: list[str], **kwargs: Any) -> CommandResult:
+                    if "shell" in args and "am start" in args[-1]:
+                        raise StandTimeoutError(f"Команда превысила таймаут 30s: {' '.join(args)}")
+                    return orig_run(args, **kwargs)
+
+                fake.run = run_with_timeout  # type: ignore[method-assign]
+                mgr = VpnClientsManager(
+                    adb_bin="/fake/adb",
+                    runner=fake,
+                    device="127.0.0.1:15565",
+                    sleep_fn=lambda _s: None,
+                )
+                with self.assertRaises(StandTimeoutError) as ctx:
+                    mgr.import_subscription(client, url=secret_url)
+                message = str(ctx.exception)
+                self.assertIn("[subscription]", message)
+                self.assertNotIn(secret_url, message)
+                self.assertNotIn(encoded_url, message)
+                self.assertIsNone(ctx.exception.__cause__)
+
+    def test_import_koala_ignores_empty_ui_xml_after_save_tap(self) -> None:
+        existing_xml = (
+            "<?xml version='1.0' encoding='utf-8' standalone='yes' ?>\n"
+            "<map><string name=\"active_profile\">existing-uuid</string></map>\n"
+        )
+        fake = _FakeVpnEnv(installed={KOALA_PACKAGE}, koala_service_xml=existing_xml)
+        save_ui = (
+            "<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>"
+            "<hierarchy><node text='Save' bounds='[928,191][1006,234]'/></hierarchy>"
+        )
+        done_ui = "<hierarchy><node text='DISCONNECTED' bounds='[0,0][100,100]'/></hierarchy>"
+        ui_sequence = iter([save_ui, "", "not-xml", done_ui])
+        dumps = 0
+        orig_run = fake.run
+
+        def run_scripted(args: list[str], **kwargs: Any) -> CommandResult:
+            nonlocal dumps
+            if "shell" in args and "uiautomator dump" in args[-1]:
+                dumps += 1
+                return _ok(next(ui_sequence, done_ui))
+            if "shell" in args and "input tap" in args[-1]:
+                fake.taps.append((967, 212))
+                return _ok()
+            return orig_run(args, **kwargs)
+
+        fake.run = run_scripted  # type: ignore[method-assign]
+        now = [0.0]
+        mgr = VpnClientsManager(
+            adb_bin="/fake/adb",
+            runner=fake,
+            device="127.0.0.1:15565",
+            sleep_fn=lambda s: now.__setitem__(0, now[0] + s),
+            monotonic_fn=lambda: now[0],
+        )
+
+        st = mgr.import_subscription("koala", url="https://sub.example.test/reimport")
+        self.assertEqual(st.active_profile, "existing-uuid")
+        self.assertEqual(dumps, 4)
+        self.assertEqual(fake.taps, [(967, 212)])
+
+    def test_import_koala_retaps_save_while_button_remains_in_tree(self) -> None:
+        fake = _FakeVpnEnv(installed={KOALA_PACKAGE})
+        orig_run = fake.run
+        tap_count = 0
+
+        def swallow_first_save_tap(args: list[str], **kwargs: Any) -> CommandResult:
+            nonlocal tap_count
+            if "shell" in args and "input tap" in args[-1]:
+                tap_count += 1
+                if tap_count == 1:
+                    fake.taps.append((967, 212))
+                    return _ok()
+            return orig_run(args, **kwargs)
+
+        fake.run = swallow_first_save_tap  # type: ignore[method-assign]
+        now = [0.0]
+        mgr = VpnClientsManager(
+            adb_bin="/fake/adb",
+            runner=fake,
+            device="127.0.0.1:15565",
+            sleep_fn=lambda s: now.__setitem__(0, now[0] + s),
+            monotonic_fn=lambda: now[0],
+        )
+
+        st = mgr.import_subscription("koala", url="https://sub.example.test/retap")
+        self.assertEqual(st.active_profile, "imported-uuid-1")
+        self.assertEqual(len(fake.taps), 2)
+        self.assertGreaterEqual(now[0], 6.0)
 
 
 class SetExcludeAndConnectTests(unittest.TestCase):
@@ -680,6 +803,51 @@ class VpnCliIntegrationTests(unittest.TestCase):
         self.assertTrue(st.vpn_active)
         self.assertEqual(st.vpn_interface, "tun0")
         self.assertFalse(any("widget.click" in " ".join(c) for c in fake.calls))
+
+    def test_happ_disconnect_ignores_foreign_koala_tun0_and_skips_widget_broadcast(self) -> None:
+        fake = _FakeVpnEnv(
+            installed={KOALA_PACKAGE, HAPP_PACKAGE},
+            connectivity=CELL_WIFI_KOALA_VPN_ALL,
+        )
+        mgr = VpnClientsManager(adb_bin="/fake/adb", runner=fake, sleep_fn=lambda _: None)
+
+        st = mgr.disconnect("happ", timeout_s=2.0)
+
+        self.assertFalse(st.vpn_active)
+        self.assertIsNone(st.vpn_interface)
+        self.assertEqual(fake.broadcasts, [])
+        self.assertTrue(fake.tun0_up)
+        self.assertEqual(parse_connectivity(fake.connectivity).vpn_owner_uid, 10192)
+
+    def test_happ_connect_does_not_treat_koala_tun0_as_already_connected(self) -> None:
+        fake = _FakeVpnEnv(
+            installed={KOALA_PACKAGE, HAPP_PACKAGE},
+            connectivity=CELL_WIFI_KOALA_VPN_ALL,
+            happ_sigill_on_connect=False,
+        )
+        mgr = VpnClientsManager(adb_bin="/fake/adb", runner=fake, sleep_fn=lambda _: None)
+
+        st = mgr.connect("happ", timeout_s=5.0)
+
+        self.assertTrue(st.vpn_active)
+        self.assertEqual(st.vpn_interface, "tun0")
+        self.assertEqual(len(fake.broadcasts), 1)
+        self.assertEqual(parse_connectivity(fake.connectivity).vpn_owner_uid, 10193)
+
+    def test_koala_disconnect_ignores_foreign_happ_tun0(self) -> None:
+        fake = _FakeVpnEnv(
+            installed={KOALA_PACKAGE, HAPP_PACKAGE},
+            connectivity=CELL_WIFI_HAPP_VPN_ALL,
+        )
+        mgr = VpnClientsManager(adb_bin="/fake/adb", runner=fake, sleep_fn=lambda _: None)
+
+        st = mgr.disconnect("koala", timeout_s=2.0)
+
+        self.assertFalse(st.vpn_active)
+        self.assertIsNone(st.vpn_interface)
+        self.assertEqual(fake.started_intents, [])
+        self.assertTrue(fake.tun0_up)
+        self.assertEqual(parse_connectivity(fake.connectivity).vpn_owner_uid, 10193)
 
 
 if __name__ == "__main__":

@@ -26,6 +26,10 @@ def _config() -> tuple[str, str, str]:
             source = Path(path).read_text()
         except FileNotFoundError:
             continue
+        except OSError as exc:
+            raise StandError(
+                f"Не удалось прочитать конфигурацию Remnawave из {path}: {exc}"
+            ) from None
         for key, value in CONFIG_LINE.findall(source):
             values.setdefault(key, value.strip().strip("\"'"))
     for key in ("REMNAWAVE_API_TOKEN", "REMNAWAVE_TOKEN", "REMNAWAVE_PANEL_URL", "SUB_PUBLIC_DOMAIN"):
@@ -35,12 +39,17 @@ def _config() -> tuple[str, str, str]:
     panel = values.get("REMNAWAVE_PANEL_URL")
     subscription_host = values.get("SUB_PUBLIC_DOMAIN", "")
     if not (token and panel):
-        result = subprocess.run(
-            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "leaseweb-nl",
-             "grep -hE '^(REMNAWAVE_API_TOKEN|REMNAWAVE_TOKEN|API_TOKEN|REMNAWAVE_PANEL_URL|SUB_PUBLIC_DOMAIN)=' "
-             + " ".join(CONFIG_FILES) + " 2>/dev/null"],
-            capture_output=True, text=True, timeout=10, check=False,
-        )
+        try:
+            result = subprocess.run(
+                ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "leaseweb-nl",
+                 "grep -hE '^(REMNAWAVE_API_TOKEN|REMNAWAVE_TOKEN|API_TOKEN|REMNAWAVE_PANEL_URL|SUB_PUBLIC_DOMAIN)=' "
+                 + " ".join(CONFIG_FILES) + " 2>/dev/null"],
+                capture_output=True, text=True, timeout=10, check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise StandError(
+                f"Не удалось получить конфигурацию Remnawave по SSH: {exc}"
+            ) from None
         remote = {k: v.strip().strip("\"'") for k, v in CONFIG_LINE.findall(result.stdout)}
         token = token or remote.get("REMNAWAVE_API_TOKEN") or remote.get("REMNAWAVE_TOKEN") or remote.get("API_TOKEN")
         panel = panel or remote.get("REMNAWAVE_PANEL_URL")

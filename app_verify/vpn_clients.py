@@ -54,6 +54,7 @@ HAPP_ACTION_WIDGET_CLICK = f"{HAPP_PACKAGE}.action.widget.click"
 HAPP_MMKV_SUB_PATH = f"/data/data/{HAPP_PACKAGE}/files/mmkv/SUB"
 HAPP_STATE_JSON_PATH = f"/data/data/{HAPP_PACKAGE}/files/app_verify_exclude.json"
 UI_DUMP_DEVICE_PATH = "/sdcard/app_verify_vpn_ui.xml"
+KOALA_SAVE_RETAP_INTERVAL_S = 7.0
 
 _CLIENT_ALIASES: dict[str, str] = {
     "koala": KOALA_CLIENT,
@@ -76,6 +77,8 @@ _PACKAGE_NAME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z][a-zA-Z0-9_]*)+
 _BOUNDS_RE = re.compile(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]")
 _ACTIVATE_VPN_RE = re.compile(r"\bACTIVATE_VPN:\s*([a-zA-Z0-9_-]+)")
 _PRIMARY_CPU_ABI_RE = re.compile(r"\bprimaryCpuAbi=([^\s]+)")
+_USER_ID_RE = re.compile(r"\buserId=(\d+)\b")
+_APP_ID_RE = re.compile(r"\bappId=(\d+)\b")
 _NETWORK_BLOCK_RE = re.compile(r"NetworkAgentInfo\s*\{")
 _TRANSPORTS_RE = re.compile(r"Transports:\s*([^\n\]]*)", re.IGNORECASE)
 _UIDS_RE = re.compile(r"Uids:\s*<\{([^}]*)\}>")
@@ -195,6 +198,18 @@ def parse_appops_activate_vpn(output: str) -> str:
     if match is None:
         return "default"
     return match.group(1).strip().lower()
+
+
+def parse_package_uid(dumpsys_output: str) -> int | None:
+    match = _USER_ID_RE.search(dumpsys_output) or _APP_ID_RE.search(dumpsys_output)
+    if match is None:
+        return None
+    return int(match.group(1))
+
+
+def _redact_subscription_url(text: str, resolved_url: str) -> str:
+    encoded = urllib.parse.quote(resolved_url, safe="")
+    return text.replace(resolved_url, "[subscription]").replace(encoded, "[subscription]")
 
 
 def extract_vpn_uid_ranges(connectivity_text: str) -> str | None:
@@ -555,11 +570,14 @@ class VpnClientsManager:
 
         raise StandError(f"APK-файл не найден: {apk_path}")
 
-    def _detect_abi_warning(self, package: str) -> str | None:
+    def _detect_abi_warning(
+        self, package: str, *, pkg_dumpsys: str | None = None
+    ) -> str | None:
         dev_res = self._run_shell(["getprop", "ro.product.cpu.abi"], check=False)
-        pkg_res = self._run_shell(["dumpsys", "package", package], check=False)
+        if pkg_dumpsys is None:
+            pkg_dumpsys = self._run_shell(["dumpsys", "package", package], check=False).stdout_text
         dev_abi = dev_res.stdout_text.strip()
-        m = _PRIMARY_CPU_ABI_RE.search(pkg_res.stdout_text)
+        m = _PRIMARY_CPU_ABI_RE.search(pkg_dumpsys)
         pkg_abi = m.group(1).strip() if m else ""
         if (
             dev_abi == "x86_64"
@@ -639,21 +657,36 @@ class VpnClientsManager:
         res = self._run_shell(["ip", "link", "show", "tun0"], check=False)
         return res.returncode == 0 and "tun0" in res.stdout_text
 
-    def _collect_status(self, client: str) -> VpnClientStatus:
+    def _collect_status_with_ownership(self, client: str) -> tuple[VpnClientStatus, bool]:
         normalized = normalize_vpn_client(client)
         package = _CLIENT_PACKAGES[normalized]
         installed = self._is_package_installed(package)
 
         activate_vpn = "missing"
         abi_warning: str | None = None
+        pkg_uid: int | None = None
         if installed:
             ops_res = self._run_shell(["appops", "get", package], check=False)
             activate_vpn = parse_appops_activate_vpn(ops_res.stdout_text)
-            abi_warning = self._detect_abi_warning(package)
+            pkg_dumpsys = self._run_shell(["dumpsys", "package", package], check=False).stdout_text
+            abi_warning = self._detect_abi_warning(package, pkg_dumpsys=pkg_dumpsys)
+            pkg_uid = parse_package_uid(pkg_dumpsys)
 
         conn_res = self._run_shell(["dumpsys", "connectivity"])
         snapshot = parse_connectivity(conn_res.stdout_text)
-        vpn_uids = extract_vpn_uid_ranges(conn_res.stdout_text) if snapshot.vpn_active else None
+        # Если известны и OwnerUid туннеля, и UID пакета, чужой tun0 не считаем активным у этого клиента.
+        if not snapshot.vpn_active:
+            own_vpn_active = False
+            foreign_vpn_active = False
+        elif snapshot.vpn_owner_uid is not None and pkg_uid is not None:
+            own_vpn_active = snapshot.vpn_owner_uid == pkg_uid
+            foreign_vpn_active = not own_vpn_active
+        else:
+            own_vpn_active = True
+            foreign_vpn_active = False
+
+        vpn_interface = snapshot.vpn_interface if own_vpn_active else None
+        vpn_uids = extract_vpn_uid_ranges(conn_res.stdout_text) if own_vpn_active else None
 
         exclude_mode = "unknown"
         excluded_packages: tuple[str, ...] = ()
@@ -670,19 +703,23 @@ class VpnClientsManager:
             if sub_res.returncode == 0:
                 active_profile = "mmkv:SUB"
 
-        return VpnClientStatus(
+        status = VpnClientStatus(
             client=normalized,
             package=package,
             installed=installed,
             activate_vpn=activate_vpn,
-            vpn_active=snapshot.vpn_active,
-            vpn_interface=snapshot.vpn_interface,
+            vpn_active=own_vpn_active,
+            vpn_interface=vpn_interface,
             exclude_mode=exclude_mode,
             excluded_packages=excluded_packages,
             active_profile=active_profile,
             vpn_uids=vpn_uids,
             abi_warning=abi_warning,
         )
+        return status, foreign_vpn_active
+
+    def _collect_status(self, client: str) -> VpnClientStatus:
+        return self._collect_status_with_ownership(client)[0]
 
     def prepare(self, client: str, *, apk: str | None = None) -> VpnClientStatus:
         normalized = normalize_vpn_client(client)
@@ -715,6 +752,31 @@ class VpnClientsManager:
             )
         return st
 
+    def _open_import_deeplink(
+        self, deeplink: str, package: str, resolved_url: str
+    ) -> CommandResult:
+        try:
+            return self._run_shell(
+                [
+                    "am",
+                    "start",
+                    "-W",
+                    "-a",
+                    "android.intent.action.VIEW",
+                    "-d",
+                    deeplink,
+                    package,
+                ],
+                check=False,
+            )
+        except StandError as exc:
+            sanitized = _redact_subscription_url(str(exc), resolved_url)
+            exc_type = type(exc)
+            try:
+                raise exc_type(sanitized) from None
+            except TypeError:
+                raise StandError(sanitized) from None
+
     def import_subscription(
         self,
         client: str,
@@ -736,19 +798,7 @@ class VpnClientsManager:
             enc_url = urllib.parse.quote(resolved_url, safe="")
             enc_name = urllib.parse.quote(profile_name, safe="")
             deeplink = f"koala-clash://install-config?url={enc_url}&name={enc_name}"
-            res = self._run_shell(
-                [
-                    "am",
-                    "start",
-                    "-W",
-                    "-a",
-                    "android.intent.action.VIEW",
-                    "-d",
-                    deeplink,
-                    KOALA_PACKAGE,
-                ],
-                check=False,
-            )
+            res = self._open_import_deeplink(deeplink, KOALA_PACKAGE, resolved_url)
             if res.returncode != 0:
                 raise StandError(
                     f"Не удалось открыть deep link импорта подписки в Koala Clash (код {res.returncode})"
@@ -756,22 +806,34 @@ class VpnClientsManager:
 
             deadline = self._monotonic() + timeout_s
             save_tapped = False
+            last_tap_at: float | None = None
             while True:
                 ui_xml = self._dump_ui_xml()
-                save_pt = find_ui_node_center(
-                    ui_xml,
-                    texts=("Save", "Сохранить"),
-                    descs=("Save", "Сохранить"),
+                ui_valid = _parse_ui_hierarchy(ui_xml) is not None
+                save_pt = (
+                    find_ui_node_center(
+                        ui_xml,
+                        texts=("Save", "Сохранить"),
+                        descs=("Save", "Сохранить"),
+                    )
+                    if ui_valid
+                    else None
                 )
-                if save_pt is not None and not save_tapped:
-                    self._run_shell(["input", "tap", str(save_pt[0]), str(save_pt[1])])
-                    save_tapped = True
-                elif save_tapped:
+                if save_tapped:
                     prefs = self._read_koala_prefs()
+                    save_gone = ui_valid and save_pt is None
                     if prefs.active_profile and (
-                        prefs.active_profile != before_profile or save_pt is None
+                        prefs.active_profile != before_profile or save_gone
                     ):
                         return self._collect_status(normalized)
+                if save_pt is not None and (
+                    not save_tapped
+                    or last_tap_at is None
+                    or self._monotonic() - last_tap_at >= KOALA_SAVE_RETAP_INTERVAL_S
+                ):
+                    self._run_shell(["input", "tap", str(save_pt[0]), str(save_pt[1])])
+                    save_tapped = True
+                    last_tap_at = self._monotonic()
 
                 if self._monotonic() >= deadline:
                     raise StandTimeoutError(
@@ -781,19 +843,7 @@ class VpnClientsManager:
                 self._sleep(2.0)
 
         deeplink = f"happ://add/{resolved_url}"
-        res = self._run_shell(
-            [
-                "am",
-                "start",
-                "-W",
-                "-a",
-                "android.intent.action.VIEW",
-                "-d",
-                deeplink,
-                HAPP_PACKAGE,
-            ],
-            check=False,
-        )
+        res = self._open_import_deeplink(deeplink, HAPP_PACKAGE, resolved_url)
         if res.returncode != 0:
             raise StandError(
                 f"Не удалось открыть deep link импорта подписки в Happ (код {res.returncode})"
@@ -824,10 +874,7 @@ class VpnClientsManager:
         self._require_installed(normalized)
 
         if normalized == KOALA_CLIENT:
-            conn_before = parse_connectivity(
-                self._run_shell(["dumpsys", "connectivity"]).stdout_text
-            )
-            was_active = conn_before.vpn_active
+            was_active = self._collect_status(KOALA_CLIENT).vpn_active
             if was_active:
                 self._disconnect_koala(timeout_s=15.0)
             self._run_shell(["am", "force-stop", KOALA_PACKAGE])
@@ -981,6 +1028,10 @@ class VpnClientsManager:
             self._sleep(1.0)
 
     def _disconnect_koala(self, *, timeout_s: float) -> VpnClientStatus:
+        st, foreign = self._collect_status_with_ownership(KOALA_CLIENT)
+        if foreign:
+            self._run_shell(["am", "force-stop", KOALA_PACKAGE], check=False)
+            return st
         self._run_shell(
             [
                 "am",
@@ -996,8 +1047,8 @@ class VpnClientsManager:
         deadline = self._monotonic() + timeout_s
         attempts = 0
         while True:
-            st = self._collect_status(KOALA_CLIENT)
-            if not st.vpn_active and not self._is_tun0_present():
+            st, foreign = self._collect_status_with_ownership(KOALA_CLIENT)
+            if not st.vpn_active and (foreign or not self._is_tun0_present()):
                 return st
             attempts += 1
             if attempts == 2:
@@ -1016,7 +1067,7 @@ class VpnClientsManager:
         if normalized == KOALA_CLIENT:
             return self._disconnect_koala(timeout_s=timeout_s)
 
-        st = self._collect_status(HAPP_CLIENT)
+        st, foreign = self._collect_status_with_ownership(HAPP_CLIENT)
         if st.vpn_active:
             self._run_shell(
                 [
@@ -1031,11 +1082,13 @@ class VpnClientsManager:
             )
             self._sleep(1.0)
         self._run_shell(["am", "force-stop", HAPP_PACKAGE], check=False)
+        if foreign:
+            return st
 
         deadline = self._monotonic() + timeout_s
         while True:
-            st = self._collect_status(HAPP_CLIENT)
-            if not st.vpn_active and not self._is_tun0_present():
+            st, foreign = self._collect_status_with_ownership(HAPP_CLIENT)
+            if not st.vpn_active and (foreign or not self._is_tun0_present()):
                 return st
             if self._monotonic() >= deadline:
                 raise StandTimeoutError(f"Таймаут отключения `tun0` в Happ ({timeout_s}s)")
