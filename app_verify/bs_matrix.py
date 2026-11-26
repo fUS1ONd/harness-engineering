@@ -33,6 +33,12 @@ RECHECK = "Проверить статус сети"
 HOME_RECHECK = "Проверить снова"
 ROUND_MESSAGE = "раунд проверки ориентиров"
 MANUAL_CLASSES = ("Широкая", "Точечная", "Нет в белых списках")
+MANUAL_ERRORS = ("наблюдение не запущено", "Не удалось запустить ручную проверку")
+MANUAL_ATTEMPTS = 3
+START = "Запустить"
+STOP_CALIBRATION = "Остановить"
+NUDGE_INTERVAL_S = 20.0
+DOZE_DEBOUNCE_GUARD_S = 35.0
 
 
 class MatrixInterrupted(BaseException):
@@ -88,6 +94,8 @@ class Matrix:
         self.log_anomalies: dict[tuple[str, ...], Any] = {}
         self.log_errors: list[str] = []
         self.log_line_count = None
+        self.last_nudge_at: float | None = None
+        self.last_round_at: float | None = None
 
     def shell(self, *args: str) -> str:
         command = [self.adb, "-s", self.device, "shell", shlex.join(args)]
@@ -187,19 +195,54 @@ class Matrix:
         self.metrics["last_diagnostics"] = snapshot
         return snapshot["runtime"]
 
-    def rounds(self) -> list[dict]:
+    def diag_rows(self) -> list[dict]:
         raw = self.shell("run-as", PACKAGE, "cat", "no_backup/diag.log")
-        rows = [json.loads(line) for line in raw.splitlines() if line.strip()]
-        return [row for row in rows if row.get("category") == "phase" and row.get("msg") == ROUND_MESSAGE]
+        return [json.loads(line) for line in raw.splitlines() if line.strip()]
+
+    def rounds(self) -> list[dict]:
+        return [row for row in self.diag_rows() if row.get("category") == "phase" and row.get("msg") == ROUND_MESSAGE]
+
+    def diag_tail(self, count: int = 15) -> list[dict]:
+        try:
+            rows = self.diag_rows()
+        except (StandError, ValueError) as exc:
+            return [{"error": str(exc)}]
+        return [
+            {key: row.get(key) for key in ("ts", "category", "msg")}
+            for row in rows if row.get("msg") != ROUND_MESSAGE
+        ][-count:]
 
     def cursor(self) -> set[str]:
         return {row["ts"] for row in self.rounds()}
 
+    def nudge_recheck(self) -> bool:
+        """Ручной recheck обходит 30-секундный дебаунс OFF-фазы; жмём не чаще NUDGE_INTERVAL_S."""
+        now = time.monotonic()
+        if self.last_nudge_at is not None and now - self.last_nudge_at < NUDGE_INTERVAL_S:
+            return False
+        self.last_nudge_at = now
+        position = self.ui_element(self.screen(), RECHECK)
+        if position is None:
+            self.debug.navigate("check")
+            position = self.ui_element(self.screen(), RECHECK)
+        if position is None:
+            self.metrics["recheck_nudge_missed"] = self.metrics.get("recheck_nudge_missed", 0) + 1
+            return False
+        self.tap_at(position)
+        self.metrics["recheck_nudges"] = self.metrics.get("recheck_nudges", 0) + 1
+        return True
+
     def phase(
-        self, expected: str, before: set[str], *, timeout: float | None = None,
+        self, expected: str, before: set[str], *, timeout: float | None = None, nudge: bool = False,
     ) -> dict:
         def observed() -> dict | None:
             runtime = self.diagnostics()
+            if (
+                nudge and expected != "OFF" and runtime.get("phase") == "OFF"
+                and runtime.get("network_conflict") == "NONE" and runtime.get("work_status") == "RUNNING"
+                and self.nudge_recheck()
+            ):
+                runtime = self.diagnostics()
             fresh = [row for row in self.rounds() if row["ts"] not in before]
             self.metrics["last_rounds"] = fresh[-3:]
             if runtime.get("phase") != expected or runtime.get("network_conflict") != "NONE":
@@ -212,6 +255,7 @@ class Matrix:
 
         start = time.monotonic()
         row = self.wait(observed, f"Нет свежего раунда {expected} без сетевого конфликта", timeout=timeout)
+        self.last_round_at = time.monotonic()
         self.metrics.setdefault("phases", []).append({
             "expected": expected, "elapsed_s": round(time.monotonic() - start, 2), "round": row,
             "diagnostics": self.metrics["last_diagnostics"],
@@ -237,6 +281,7 @@ class Matrix:
 
     def recheck(self) -> None:
         self.tap(RECHECK)
+        self.last_nudge_at = time.monotonic()
         self.metrics["recheck_button"] = RECHECK
 
     def clear_conflict(self) -> None:
@@ -279,50 +324,101 @@ class Matrix:
         before = self.cursor()
         self.profile("soft", "off")
         self.recheck()
-        self.require_landmarks(self.phase("SOFT", before))
+        self.require_landmarks(self.phase("SOFT", before, nudge=True))
         for profile in ("hard", "down", "off"):
             before = self.cursor()
             self.profile(profile, "off")
-            self.phase(profile.upper(), before)
+            self.phase(profile.upper(), before, nudge=True)
+        self.metrics.setdefault("recheck_nudges", 0)
 
     def wifi_cellular(self) -> None:
         self.baseline("on")
         before = self.cursor()
         self.profile("soft", "on")
         self.recheck()
-        self.require_landmarks(self.phase("SOFT", before))
+        self.require_landmarks(self.phase("SOFT", before, nudge=True))
 
     def wifi_toggle(self) -> None:
         self.baseline()
         before = self.cursor()
         self.profile("soft", "off")
         self.recheck()
-        self.phase("SOFT", before)
+        self.phase("SOFT", before, nudge=True)
         for wifi in ("on", "off"):
             before = self.cursor()
             self.shell("svc", "wifi", "enable" if wifi == "on" else "disable")
             self.network("soft", wifi)
-            self.phase("SOFT", before)
+            self.phase("SOFT", before, nudge=True)
+
+    def manual_allowed(self) -> bool:
+        runtime = self.diagnostics()
+        if not (
+            runtime.get("work_status") == "RUNNING" and runtime.get("phase") in ("SOFT", "HARD")
+            and runtime.get("network_conflict") == "NONE"
+        ):
+            return False
+        tree = self.screen()
+        return self.ui_element(tree, RECHECK) is None and self.ui_element(tree, "Проверить") is not None
+
+    def manual_outcome(self) -> tuple[str, str] | None:
+        tree = self.screen()
+        if f'text="{self.manual_target}"' in tree:
+            label = next((label for label in MANUAL_CLASSES if f'text="{label}"' in tree), None)
+            if label:
+                return "result", label
+        error = next((line for line in tree.splitlines() if any(marker in line for marker in MANUAL_ERRORS)), None)
+        if error:
+            match = re.search(r'text=("(?:[^"\\]|\\.)*")', error)
+            return "error", json.loads(match.group(1)) if match else error
+        return None
+
+    def stop_calibration_if_running(self) -> bool:
+        """Останавливает фоновую автокалибровку, если она временно поставила orchestrator на паузу."""
+        self.debug.navigate("calibration")
+        try:
+            position = self.ui_element(self.screen(), STOP_CALIBRATION)
+            if position is None:
+                return False
+            self.tap_at(position)
+            self.metrics["stopped_calibration"] = self.metrics.get("stopped_calibration", 0) + 1
+            return True
+        finally:
+            self.debug.navigate("check")
 
     def manual_check(self) -> None:
         self.baseline()
         before = self.cursor()
         self.profile("soft", "off")
         self.recheck()
-        self.phase("SOFT", before)
+        self.phase("SOFT", before, nudge=True)
+        self.debug.navigate("check")
+        self.wait(self.manual_allowed, "Ручная проверка не стала доступна в фазе SOFT")
         self.tap("77.73.236.0/24, IP или домен")
         self.type_text(self.manual_target)
         self.press("BACK")
-        self.tap("Проверить")
-
-        def result() -> str | None:
-            tree = self.screen()
-            if f'text="{self.manual_target}"' not in tree:
-                return None
-            return next((label for label in MANUAL_CLASSES if f'text="{label}"' in tree), None)
-
-        label = self.wait(result, f"Нет завершённого результата ручной проверки {self.manual_target}")
-        self.metrics["manual_result"] = {"target": self.manual_target, "class": label}
+        errors = []
+        for attempt in range(1, MANUAL_ATTEMPTS + 1):
+            self.wait(self.manual_allowed, "Ручная проверка не стала доступна в фазе SOFT")
+            if f'text="{self.manual_target}"' not in self.screen():
+                self.tap("77.73.236.0/24, IP или домен")
+                self.type_text(self.manual_target)
+                self.press("BACK")
+            self.metrics["manual_attempts"] = attempt
+            self.tap("Проверить")
+            if attempt > 1:
+                time.sleep(min(1.0, self.phase_timeout))
+            kind, value = self.wait(self.manual_outcome, f"Нет завершённого результата ручной проверки {self.manual_target}")
+            if kind == "result":
+                self.metrics["manual_result"] = {"target": self.manual_target, "class": value}
+                return
+            errors.append({"attempt": attempt, "error": value, "diag_tail": self.diag_tail()})
+            self.metrics["manual_errors"] = errors
+            if attempt < MANUAL_ATTEMPTS:
+                before = self.cursor()
+                if "наблюдение не запущено" in value:
+                    self.stop_calibration_if_running()
+                self.phase("SOFT", before, nudge=True)
+        raise StandError(f"Ручная проверка {self.manual_target} вернула ошибку: {errors[-1]['error']}")
 
     def subscription(self) -> str:
         if not self.url:
@@ -390,7 +486,7 @@ class Matrix:
         before = self.cursor()
         self.profile("soft", "off", vpn=True)
         self.adapter.launch(PACKAGE)
-        self.require_landmarks(self.phase("SOFT", before))
+        self.require_landmarks(self.phase("SOFT", before, nudge=True))
         self.metrics["network_conflict"] = "NONE"
 
     def leave_idle(self) -> dict[str, str]:
@@ -408,6 +504,12 @@ class Matrix:
             self.metrics["deviceidle"] = idle
             require(idle == "IDLE", "Android не вошёл в глубокий Doze")
             self.profile("soft", "off")
+            # onResume() делает recheck без manual: держим Doze >= 35 с, чтобы выйти за 30-секундный дебаунс.
+            hold = max(0.0, float(DOZE_DEBOUNCE_GUARD_S))
+            self.metrics["doze_hold_s"] = round(hold, 2)
+            if hold > 0:
+                time.sleep(hold)
+            self.metrics["since_baseline_round_s"] = round(time.monotonic() - (self.last_round_at or 0.0), 2)
         finally:
             self.leave_idle()
         runtime = self.diagnostics()
@@ -425,7 +527,22 @@ class Matrix:
         self.profile("soft", "off")
         before = self.cursor()
         self.adapter.launch(PACKAGE)
-        self.phase("SOFT", before)
+        self.wait(lambda: self.diagnostics().get("runtime_present"), "Сервис приложения не поднялся после cold start", timeout=30)
+        try:
+            self.wait(lambda: self.diagnostics().get("work_status") == "RUNNING", "", timeout=min(10.0, self.phase_timeout))
+            restored = True
+        except StandError:
+            restored = False
+        runtime = self.metrics["last_diagnostics"]["runtime"]
+        self.metrics["observation_auto_restored"] = restored
+        self.metrics["work_status_after_launch"] = runtime.get("work_status")
+        if not restored:
+            # Продукт не восстанавливает наблюдение при запуске Activity после force-stop: запускаем вручную.
+            self.debug.navigate("home")
+            self.tap(START)
+            self.metrics["start_button"] = START
+            self.wait(lambda: self.diagnostics().get("work_status") == "RUNNING", "Наблюдение не запустилось после «Запустить»", timeout=30)
+        self.require_landmarks(self.phase("SOFT", before, nudge=True))
 
     def happ(self) -> None:
         self.profile("off", "on")
@@ -458,7 +575,7 @@ class Matrix:
         before = self.cursor()
         self.profile("soft", "off", vpn=True)
         self.adapter.launch(PACKAGE)
-        self.require_landmarks(self.phase("SOFT", before))
+        self.require_landmarks(self.phase("SOFT", before, nudge=True))
 
     def disconnect(self, client: str) -> dict:
         status = self.vpn.status(client)
@@ -624,7 +741,7 @@ def run_bs_matrix(
                 if matrix.idle_forced:
                     cleanup("deviceidle_unforce", matrix.leave_idle)
                 for client in ("koala", "happ"):
-                    cleanup(f"vpn_disconnect_{client}", lambda: matrix.disconnect(client))
+                    cleanup(f"vpn_disconnect_{client}", lambda client=client: matrix.disconnect(client))
                 cleanup("net_reset", matrix.reset_network)
                 report["stability"] = matrix.collect_stability()
             if matrix.temporary:

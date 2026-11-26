@@ -54,14 +54,22 @@ class TemporarySubscription:
     def __init__(self) -> None:
         self.username = f"bs_matrix_{uuid4().hex[:16]}"
         self.panel, self.token, self.subscription_host = _config()
-        self.uuid: str | None = None
+        self.user_id: str | None = None
+        self.url: str | None = None
         self.create_attempted = False
+
+    @property
+    def uuid(self) -> str | None:
+        return self.user_id
 
     def _request(self, method: str, path: str, body: dict | None = None) -> dict | None:
         request = urllib.request.Request(
             self.panel + path,
             data=json.dumps(body).encode() if body is not None else None,
-            headers={"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"},
+            headers={
+                "Authorization": f"Bearer {self.token}", "Content-Type": "application/json",
+                "User-Agent": "app-verify-bs-matrix/1.0",
+            },
             method=method,
         )
         try:
@@ -75,20 +83,22 @@ class TemporarySubscription:
         except (OSError, ValueError):
             raise StandError(f"Remnawave {method}: запрос не завершился или вернул некорректный JSON") from None
 
-    def create(self) -> str:
-        expires = dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=1)
-        self.create_attempted = True
-        response = self._request("POST", "/api/users", {
-            "username": self.username,
-            "status": "ACTIVE",
-            "expireAt": expires.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "activeInternalSquads": list(TEST_SQUADS),
-            "hwidDeviceLimit": 2,
-        })
-        user = (response or {}).get("response", {})
-        self.uuid = user.get("uuid")
-        if not self.uuid:
-            raise StandError("Remnawave не вернул uuid временного пользователя")
+    @staticmethod
+    def _user(payload: dict | None) -> dict:
+        user = (payload or {}).get("response", payload or {})
+        return user if isinstance(user, dict) else {}
+
+    @staticmethod
+    def _identifier(user: dict) -> str | None:
+        # Remnawave 2.x отдаёт числовой `id` вместо `uuid`; DELETE /api/users/{id} принимает оба.
+        value = user.get("uuid") or user.get("id")
+        return str(value) if value not in (None, "") else None
+
+    def _lookup(self) -> dict | None:
+        found = self._request("GET", f"/api/users/by-username/{self.username}")
+        return self._user(found) if found is not None else None
+
+    def _subscription_url(self, user: dict) -> str:
         url = user.get("subscriptionUrl")
         if not url and self.subscription_host and user.get("shortUuid"):
             base = self.subscription_host.rstrip("/")
@@ -99,16 +109,54 @@ class TemporarySubscription:
             raise StandError("Remnawave не вернул URL временной подписки")
         return url
 
+    def _remember(self, user: dict) -> str:
+        self.user_id = self._identifier(user)
+        if not self.user_id:
+            raise StandError("Remnawave не вернул id временного пользователя")
+        self.url = self._subscription_url(user)
+        return self.url
+
+    def create(self) -> str:
+        if self.url:
+            return self.url
+        if self.create_attempted:
+            existing = self._lookup()
+            if existing:
+                return self._remember(existing)
+        expires = dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=1)
+        self.create_attempted = True
+        try:
+            response = self._request("POST", "/api/users", {
+                "username": self.username,
+                "status": "ACTIVE",
+                "expireAt": expires.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "activeInternalSquads": list(TEST_SQUADS),
+                "hwidDeviceLimit": 2,
+            })
+        except StandError:
+            existing = self._lookup()
+            if not existing:
+                raise
+            return self._remember(existing)
+        user = self._user(response)
+        if not self._identifier(user):
+            user = self._lookup() or user
+        return self._remember(user)
+
     def delete(self) -> dict:
         if not self.create_attempted:
             return {"deleted": False}
-        lookup = f"/api/users/by-username/{self.username}"
-        if not self.uuid:
-            user = self._request("GET", lookup)
+        if not self.user_id:
+            user = self._lookup()
             if user is None:
                 return {"deleted": True, "username": self.username}
-            self.uuid = user["response"]["uuid"]
-        self._request("DELETE", f"/api/users/{self.uuid}")
-        if self._request("GET", lookup) is not None:
+            self.user_id = self._identifier(user)
+            if not self.user_id:
+                raise StandError(f"Remnawave не вернул id пользователя {self.username}")
+        self._request("DELETE", f"/api/users/{self.user_id}")
+        if self._lookup() is not None:
             raise StandError(f"Временный пользователь {self.username} всё ещё существует")
+        self.user_id = None
+        self.url = None
+        self.create_attempted = False
         return {"deleted": True, "username": self.username}

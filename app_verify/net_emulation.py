@@ -17,6 +17,7 @@ from .android import CommandResult, CommandRunner, SubprocessRunner, find_local_
 from .core import StandError
 
 CHAIN_NAME = "RUMAP_WL"
+STAGING_CHAIN = f"{CHAIN_NAME}_NEXT"
 
 DEFAULT_WHITELISTED_IPS: tuple[str, ...] = (
     "77.88.55.242",
@@ -435,20 +436,70 @@ class NetEmulationClient:
             if line.strip().startswith("-A ")
         )
 
-    def _cleanup_chain(self) -> None:
-        """Идемпотентно снимает все ссылки `OUTPUT -> RUMAP_WL`, чистит и удаляет цепочку."""
+    def _output_jumps(self, chain: str) -> list[tuple[int, list[str]]]:
+        """Позиции (с 1) и аргументы правил `OUTPUT`, прыгающих в `chain`."""
         output = self._iptables("-S", "OUTPUT", check=False)
-        if output.returncode == 0:
-            for line in output.stdout_text.splitlines():
-                stripped = line.strip()
-                if not stripped.startswith("-A OUTPUT"):
-                    continue
-                tokens = _rule_tokens(stripped)
-                if tokens[:2] != ["-A", "OUTPUT"] or _jump(tokens) != CHAIN_NAME:
-                    continue
-                self._iptables("-D", "OUTPUT", *tokens[2:], check=False)
-        self._iptables("-F", CHAIN_NAME, check=False)
-        self._iptables("-X", CHAIN_NAME, check=False)
+        if output.returncode != 0:
+            return []
+        jumps: list[tuple[int, list[str]]] = []
+        position = 0
+        for line in output.stdout_text.splitlines():
+            stripped = line.strip()
+            if not stripped.startswith("-A OUTPUT"):
+                continue
+            tokens = _rule_tokens(stripped)
+            if tokens[:2] != ["-A", "OUTPUT"]:
+                continue
+            position += 1
+            if _jump(tokens) == chain:
+                jumps.append((position, tokens[2:]))
+        return jumps
+
+    def _drop_chain(self, chain: str) -> None:
+        """Идемпотентно снимает все ссылки `OUTPUT -> chain`, чистит и удаляет цепочку."""
+        for _, rule in self._output_jumps(chain):
+            self._iptables("-D", "OUTPUT", *rule, check=False)
+        self._iptables("-F", chain, check=False)
+        self._iptables("-X", chain, check=False)
+
+    def _cleanup_chain(self) -> None:
+        self._drop_chain(STAGING_CHAIN)
+        self._drop_chain(CHAIN_NAME)
+
+    def _fill_chain(self, chain: str, rules: Sequence[Sequence[str]]) -> None:
+        if self._iptables("-N", chain, check=False).returncode != 0:
+            self._iptables("-F", chain)
+        for rule in rules:
+            self._iptables("-A", chain, *rule)
+
+    def _switch_jump(self, source: str, target: str, cell_interface: str) -> None:
+        """Одной командой `-R` перенаправляет прыжок из `OUTPUT`, не оставляя окна без правил."""
+        jump = ["-o", cell_interface, "-j", target]
+        existing = self._output_jumps(source)
+        if existing:
+            position, _ = existing[0]
+            self._iptables("-R", "OUTPUT", str(position), *jump)
+            for _, rule in existing[1:]:
+                self._iptables("-D", "OUTPUT", *rule, check=False)
+        else:
+            self._iptables("-I", "OUTPUT", "1", *jump)
+        if not any(rule == jump for _, rule in self._output_jumps(target)):
+            raise StandError(f"Прыжок OUTPUT -> {target} не установлен; правила БС не применены")
+
+    def _replace_chain(self, rules: Sequence[Sequence[str]], cell_interface: str) -> None:
+        """Атомарно подменяет правила `RUMAP_WL`.
+
+        Новые правила собираются во временной цепочке, прыжок из `OUTPUT` переключается
+        на неё одной командой, затем `RUMAP_WL` пересобирается и прыжок возвращается.
+        В каждый момент трафик через `$CELL_IF` фильтруется полным старым или новым профилем,
+        поэтому раунд ориентиров не видит «голую» сеть посреди смены профиля.
+        """
+        self._drop_chain(STAGING_CHAIN)
+        self._fill_chain(STAGING_CHAIN, rules)
+        self._switch_jump(CHAIN_NAME, STAGING_CHAIN, cell_interface)
+        self._fill_chain(CHAIN_NAME, rules)
+        self._switch_jump(STAGING_CHAIN, CHAIN_NAME, cell_interface)
+        self._drop_chain(STAGING_CHAIN)
 
     def _apply_wifi(self, action: str | None) -> None:
         if action is None:
@@ -498,14 +549,11 @@ class NetEmulationClient:
         if normalized != "off":
             cell_interface = self._require_cell_interface()
 
-        self._cleanup_chain()
-
-        if normalized != "off":
-            self._iptables("-N", CHAIN_NAME)
-            for rule in build_profile_rules(normalized, whitelist):
-                self._iptables("-A", CHAIN_NAME, *rule)
+        if normalized == "off":
+            self._cleanup_chain()
+        else:
             # Прыжок строго по сотовому интерфейсу: adb/lo/wlan/10.0.2.0/24 не затрагиваются.
-            self._iptables("-I", "OUTPUT", "1", "-o", cell_interface, "-j", CHAIN_NAME)
+            self._replace_chain(build_profile_rules(normalized, whitelist), cell_interface)
 
         self._apply_wifi(wifi_action)
         return self._collect_status()

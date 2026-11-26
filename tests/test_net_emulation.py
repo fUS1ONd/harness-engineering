@@ -18,6 +18,7 @@ from app_verify.net_emulation import (
     DEFAULT_CONTROL_IPS,
     DEFAULT_WHITELISTED_IPS,
     NetEmulationClient,
+    STAGING_CHAIN,
     allowed_ips,
     build_profile_rules,
     detect_profile,
@@ -117,6 +118,7 @@ class _FakeAdb:
         self.iptables_calls: list[list[str]] = []
         self.svc_calls: list[str] = []
         self.devices: list[str | None] = []
+        self.effective_history: list[list[list[list[str]]]] = []
 
     def run(self, args, *, timeout=None, input_bytes=None, env=None) -> CommandResult:
         self.calls.append(list(args))
@@ -156,6 +158,20 @@ class _FakeAdb:
             if len(argv) < 2:
                 return _fail("iptables: option -w requires an argument")
             argv = argv[2:] if argv[1].isdigit() else argv[1:]
+        result = self._iptables_command(argv)
+        if argv[:1] != ["-S"]:
+            self.effective_history.append(self.effective_cell_rules())
+        return result
+
+    def effective_cell_rules(self) -> list[list[list[str]]]:
+        """Цепочки, которые реально фильтруют трафик через OUTPUT, в порядке прыжков."""
+        return [
+            [list(rule) for rule in self.chains[jump[-1]]]
+            for jump in self.output_rules
+            if jump[-1] in self.chains
+        ]
+
+    def _iptables_command(self, argv: list[str]) -> CommandResult:
 
         if argv[:1] == ["-S"]:
             target = argv[1]
@@ -187,7 +203,20 @@ class _FakeAdb:
         if argv[:1] == ["-I"]:
             if argv[1] != "OUTPUT" or argv[2] != "1":
                 return _fail("unsupported insert")
+            if argv[-1] not in self.chains:
+                return _fail("iptables: No chain/target/match by that name.")
             self.output_rules.insert(0, list(argv[3:]))
+            return _ok()
+
+        if argv[:1] == ["-R"]:
+            if argv[1] != "OUTPUT":
+                return _fail("unsupported replace")
+            index = int(argv[2]) - 1
+            if not 0 <= index < len(self.output_rules):
+                return _fail("iptables: Index of replacement too big.")
+            if argv[-1] not in self.chains:
+                return _fail("iptables: No chain/target/match by that name.")
+            self.output_rules[index] = list(argv[3:])
             return _ok()
 
         if argv[:1] == ["-D"]:
@@ -218,6 +247,8 @@ class _FakeAdb:
                 return _fail("iptables: No chain/target/match by that name.")
             if self.chains[name]:
                 return _fail("iptables: Directory not empty.")
+            if any(rule[-1] == name for rule in self.output_rules):
+                return _fail("iptables: Too many links.")
             del self.chains[name]
             return _ok()
 
@@ -408,6 +439,54 @@ class ApplyProfileTests(unittest.TestCase):
         self.assertEqual(
             fake.chains[CHAIN_NAME], build_profile_rules("hard", ["1.2.3.4"])
         )
+
+    def test_switching_profiles_never_leaves_cell_traffic_unfiltered(self) -> None:
+        transitions = (("soft", "hard"), ("hard", "down"), ("down", "soft"), ("hard", "hard"))
+        for old, new in transitions:
+            with self.subTest(old=old, new=new):
+                fake = _FakeAdb(
+                    chain_rules=build_profile_rules(old),
+                    output_rules=[["-j", "oem_out"], ["-o", "rmnet_data0", "-j", CHAIN_NAME]],
+                )
+                fake.chains["oem_out"] = []
+                status = _client(fake).apply_profile(new)
+
+                allowed = ([[], build_profile_rules(old)], [[], build_profile_rules(new)])
+                for state in fake.effective_history:
+                    self.assertIn(state, allowed)
+                self.assertEqual(status.profile, new)
+                self.assertEqual(
+                    fake.output_rules,
+                    [["-j", "oem_out"], ["-o", "rmnet_data0", "-j", CHAIN_NAME]],
+                )
+                self.assertEqual(fake.chains[CHAIN_NAME], build_profile_rules(new))
+                self.assertNotIn(STAGING_CHAIN, fake.chains)
+
+    def test_enabling_profile_from_off_applies_full_rules_in_one_step(self) -> None:
+        fake = _FakeAdb()
+        _client(fake).apply_profile("hard")
+
+        states = [state for state in fake.effective_history if state]
+        self.assertTrue(states)
+        self.assertTrue(all(state == [build_profile_rules("hard")] for state in states))
+        first = fake.effective_history.index(states[0])
+        self.assertTrue(all(fake.effective_history[first:]))
+
+    def test_leftover_staging_chain_is_replaced_and_removed(self) -> None:
+        fake = _FakeAdb(
+            chain_rules=build_profile_rules("soft"),
+            output_rules=[
+                ["-o", "rmnet_data0", "-j", STAGING_CHAIN],
+                ["-o", "rmnet_data0", "-j", CHAIN_NAME],
+            ],
+        )
+        fake.chains[STAGING_CHAIN] = [["-p", "tcp", "--dport", "80", "-j", "DROP"]]
+
+        status = _client(fake).apply_profile("down")
+
+        self.assertEqual(status.profile, "down")
+        self.assertEqual(fake.output_rules, [["-o", "rmnet_data0", "-j", CHAIN_NAME]])
+        self.assertNotIn(STAGING_CHAIN, fake.chains)
 
     def test_reapplying_same_profile_is_idempotent(self) -> None:
         fake = _FakeAdb()

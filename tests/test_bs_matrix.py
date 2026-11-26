@@ -53,6 +53,11 @@ class FakeStand:
         self.tab = "home"
         self.elements = {}
         self.check_result = False
+        self.manual_error = None
+        self.calibration_running = False
+        self.pause_on_cold_launch = False
+        self.work_status = "RUNNING"
+        self.suppress_auto_round_transitions = set()
         self.target = ""
 
     def start(self):
@@ -64,8 +69,14 @@ class FakeStand:
 
     def launch(self, _package):
         self.actions.append("launch")
+        was_stopped = not self.process
         self.bg = False
         self.process = True
+        if was_stopped and self.pause_on_cold_launch:
+            self.work_status = "PAUSED"
+            self.phase = "UNKNOWN"
+            return
+        self.work_status = "RUNNING"
         self.round()
 
     def collect_logs(self, **kwargs):
@@ -109,6 +120,8 @@ class FakeStand:
         self.actions.append(("profile", profile, wifi))
         previous = self.profile_name
         self.profile_name, self.wifi = profile, wifi
+        if (previous, profile) in self.suppress_auto_round_transitions:
+            return
         if not (previous == "off" and profile == "soft"):
             self.round()
 
@@ -126,21 +139,31 @@ class FakeStand:
     def dump_diagnostics(self):
         return SimpleNamespace(diagnostics={"mock_preset": "clear", "runtime": {
             "phase": self.phase, "network_conflict": self.conflict, "runtime_present": True,
-            "work_status": "RUNNING", "vpn_active": self.active is not None,
+            "work_status": self.work_status, "vpn_active": self.active is not None,
         }})
 
     def navigate(self, tab):
+        self.actions.append(("navigate", tab))
         self.tab = tab
-        self.check_result = False
+        if tab != "check":
+            self.check_result = False
 
     def call_tool(self, name, arguments):
         if name == "mobile_list_elements_on_screen":
-            options = [
-                "Проверить статус сети", "77.73.236.0/24, IP или домен", "Проверить", "Настройки VPN",
-                "Проверить снова",
-            ]
-            if self.check_result:
-                options.extend([self.target, "Точечная"])
+            if self.tab == "calibration":
+                options = ["Остановить"] if self.calibration_running else ["Подобрать скорость"]
+            else:
+                options = ["77.73.236.0/24, IP или домен", "Проверить", "Настройки VPN", "Проверить снова"]
+                if self.phase == "OFF":
+                    options.insert(0, "Проверить статус сети")
+                if self.work_status != "RUNNING":
+                    options.append("Запустить")
+                if self.target:
+                    options.append(self.target)
+                if self.manual_error:
+                    options.append(self.manual_error)
+                if self.check_result:
+                    options.append("Точечная")
             self.elements = {i: label for i, label in enumerate(options, 1)}
             return SimpleNamespace(text="\n".join(
                 f'@e{i} Button text="{label}" at={i},0 size=1x1' for i, label in self.elements.items()
@@ -157,8 +180,19 @@ class FakeStand:
             self.actions.append(("tap", label))
             if label == "Проверить статус сети":
                 self.round()
+            if label == "Запустить":
+                self.work_status = "RUNNING"
+                self.round()
+            if label == "Остановить":
+                self.calibration_running = False
+                self.round()
             if label == "Проверить":
-                self.check_result = True
+                if self.calibration_running:
+                    self.manual_error = "orchestrator: наблюдение не запущено"
+                    self.check_result = False
+                else:
+                    self.manual_error = None
+                    self.check_result = True
             if label == "Проверить снова" and not self.sticky_conflict:
                 self.conflict = "NONE"
                 self.round()
@@ -230,7 +264,7 @@ class FakeStand:
 
 
 class MatrixRunTests(unittest.TestCase):
-    def run_matrix(self, stand, **options):
+    def run_matrix(self, stand, *, doze_guard=0.0, nudge_interval=0.0, **options):
         with ExitStack() as stack:
             for name, value in {
                 "find_local_adb": Mock(return_value="/fake/adb"),
@@ -243,6 +277,8 @@ class MatrixRunTests(unittest.TestCase):
                 "DebugHooksClient": Mock(return_value=stand),
                 "VpnClientsManager": Mock(return_value=stand),
                 "TemporarySubscription": Mock(return_value=stand),
+                "DOZE_DEBOUNCE_GUARD_S": doze_guard,
+                "NUDGE_INTERVAL_S": nudge_interval,
             }.items():
                 stack.enter_context(patch(f"app_verify.bs_matrix.{name}", value))
             stack.enter_context(patch.dict(os.environ, {"APP_VERIFY_VPN_SUBSCRIPTION_URL": ""}))
@@ -336,6 +372,52 @@ class MatrixRunTests(unittest.TestCase):
         self.assertEqual(scenario["status"], "fail")
         self.assertIn("не снял конфликт VPN_BLOCKED", scenario["reason"])
 
+    def test_cellular_phases_nudges_recheck_when_stuck_in_off(self):
+        stand = FakeStand()
+        stand.suppress_auto_round_transitions.add(("soft", "hard"))
+        original_apply = stand.apply_profile
+
+        def apply_with_off_fallback(profile, *, allow_ips, wifi):
+            if (stand.profile_name, profile) == ("soft", "hard"):
+                stand.phase = "OFF"
+            return original_apply(profile, allow_ips=allow_ips, wifi=wifi)
+
+        stand.apply_profile = apply_with_off_fallback
+        report = self.run_matrix(stand, scenarios=["cellular-phases"], nudge_interval=0.0)
+        scenario = report["scenarios"]["cellular-phases"]
+        self.assertEqual(scenario["status"], "pass", scenario)
+        self.assertGreaterEqual(scenario["metrics"]["recheck_nudges"], 1)
+
+    def test_manual_check_stops_auto_calibration_and_retries_on_not_running(self):
+        stand = FakeStand()
+        stand.calibration_running = True
+        report = self.run_matrix(stand, scenarios=["manual-check"])
+        scenario = report["scenarios"]["manual-check"]
+        self.assertEqual(scenario["status"], "pass", scenario)
+        self.assertEqual(scenario["metrics"]["manual_attempts"], 2)
+        self.assertEqual(scenario["metrics"]["stopped_calibration"], 1)
+        self.assertEqual(scenario["metrics"]["manual_result"]["class"], "Точечная")
+        self.assertIn(("tap", "Остановить"), stand.actions)
+
+    def test_doze_resume_holds_doze_past_debounce_window(self):
+        stand = FakeStand()
+        with patch("app_verify.bs_matrix.time.sleep") as sleep_mock:
+            report = self.run_matrix(stand, scenarios=["doze-resume"], doze_guard=35.0)
+        scenario = report["scenarios"]["doze-resume"]
+        self.assertEqual(scenario["status"], "pass", scenario)
+        self.assertEqual(scenario["metrics"]["doze_hold_s"], 35.0)
+        self.assertTrue(any(call.args and call.args[0] >= 35.0 for call in sleep_mock.call_args_list))
+
+    def test_cold_start_paused_after_launch_records_metric_and_starts_observation(self):
+        stand = FakeStand()
+        stand.pause_on_cold_launch = True
+        report = self.run_matrix(stand, scenarios=["cold-start"])
+        scenario = report["scenarios"]["cold-start"]
+        self.assertEqual(scenario["status"], "pass", scenario)
+        self.assertFalse(scenario["metrics"]["observation_auto_restored"])
+        self.assertEqual(scenario["metrics"]["work_status_after_launch"], "PAUSED")
+        self.assertEqual(scenario["metrics"]["start_button"], "Запустить")
+
 
 class SubscriptionTests(unittest.TestCase):
     def test_cleanup_looks_up_user_when_creation_response_was_lost(self):
@@ -348,6 +430,87 @@ class SubscriptionTests(unittest.TestCase):
                 subscription.create()
             self.assertTrue(subscription.delete()["deleted"])
         self.assertEqual(request.call_args_list[2].args, ("DELETE", "/api/users/test-uuid"))
+
+
+class RemnawaveUserFormatTests(unittest.TestCase):
+    USER = {
+        "id": 192, "shortUuid": "short", "username": "bs_matrix_x", "status": "ACTIVE",
+        "subscriptionUrl": "https://sub.invalid/short",
+    }
+
+    def subscription(self, host=""):
+        with patch("app_verify.remnawave._config", return_value=("https://panel.invalid", "token", host)):
+            return TemporarySubscription()
+
+    def test_create_parses_remnawave_numeric_id_and_is_idempotent(self):
+        subscription = self.subscription()
+        with patch.object(subscription, "_request", return_value={"response": dict(self.USER)}) as request:
+            self.assertEqual(subscription.create(), "https://sub.invalid/short")
+            self.assertEqual(subscription.create(), "https://sub.invalid/short")
+        self.assertEqual(request.call_count, 1)
+        self.assertEqual(request.call_args.args[:2], ("POST", "/api/users"))
+        self.assertEqual(subscription.user_id, "192")
+
+    def test_create_builds_url_from_short_uuid_and_looks_up_missing_id(self):
+        subscription = self.subscription("sub.invalid")
+        user = {key: value for key, value in self.USER.items() if key != "subscriptionUrl"}
+        with patch.object(subscription, "_request", side_effect=[
+            {"response": {"username": subscription.username}}, {"response": user},
+        ]) as request:
+            self.assertEqual(subscription.create(), "https://sub.invalid/short")
+        self.assertEqual(request.call_args_list[1].args, ("GET", f"/api/users/by-username/{subscription.username}"))
+        self.assertEqual(subscription.user_id, "192")
+
+    def test_repeated_create_after_conflict_reuses_existing_user(self):
+        subscription = self.subscription()
+        with patch.object(subscription, "_request", side_effect=[
+            StandError("Remnawave POST: HTTP 400"), {"response": dict(self.USER)},
+        ]) as request:
+            self.assertEqual(subscription.create(), "https://sub.invalid/short")
+            self.assertEqual(subscription.create(), "https://sub.invalid/short")
+        self.assertEqual([call.args[0] for call in request.call_args_list], ["POST", "GET"])
+
+    def test_retry_after_failed_create_does_not_post_twice_when_user_exists(self):
+        subscription = self.subscription()
+        with patch.object(subscription, "_request", side_effect=[
+            {"response": {"id": 192}}, {"response": dict(self.USER)},
+        ]) as request:
+            with self.assertRaises(StandError):
+                subscription.create()
+            self.assertEqual(subscription.create(), "https://sub.invalid/short")
+        self.assertEqual([call.args[0] for call in request.call_args_list], ["POST", "GET"])
+
+    def test_create_failure_without_user_is_reported(self):
+        subscription = self.subscription()
+        with patch.object(subscription, "_request", side_effect=[StandError("Remnawave POST: HTTP 500"), None]):
+            with self.assertRaisesRegex(StandError, "HTTP 500"):
+                subscription.create()
+
+    def test_delete_uses_numeric_id_and_verifies_absence(self):
+        subscription = self.subscription()
+        with patch.object(subscription, "_request", side_effect=[
+            {"response": dict(self.USER)}, {}, None,
+        ]) as request:
+            subscription.create()
+            self.assertEqual(subscription.delete(), {"deleted": True, "username": subscription.username})
+        self.assertEqual(request.call_args_list[1].args, ("DELETE", "/api/users/192"))
+        self.assertEqual(request.call_args_list[2].args, ("GET", f"/api/users/by-username/{subscription.username}"))
+
+    def test_delete_looks_up_numeric_id_when_create_response_was_lost(self):
+        subscription = self.subscription()
+        subscription.create_attempted = True
+        with patch.object(subscription, "_request", side_effect=[{"response": dict(self.USER)}, {}, None]) as request:
+            self.assertTrue(subscription.delete()["deleted"])
+        self.assertEqual(request.call_args_list[1].args, ("DELETE", "/api/users/192"))
+
+    def test_delete_fails_when_user_survives(self):
+        subscription = self.subscription()
+        with patch.object(subscription, "_request", side_effect=[
+            {"response": dict(self.USER)}, {}, {"response": dict(self.USER)},
+        ]):
+            subscription.create()
+            with self.assertRaisesRegex(StandError, "всё ещё существует"):
+                subscription.delete()
 
 
 class UiFallbackTests(unittest.TestCase):
