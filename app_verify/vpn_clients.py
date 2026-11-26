@@ -149,6 +149,8 @@ def resolve_subscription_url(
             "Не указан URL подписки: передайте `--url <https://...>` или задайте "
             f"переменную окружения `{SUBSCRIPTION_URL_ENV}`"
         )
+    if any(ch.isspace() for ch in candidate):
+        raise StandError("Некорректный URL подписки: пробельные и управляющие символы недопустимы")
     parsed = urllib.parse.urlparse(candidate)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise StandError(
@@ -295,6 +297,18 @@ def _parse_bounds_center(bounds: str) -> tuple[int, int] | None:
     return (x1 + x2) // 2, (y1 + y2) // 2
 
 
+def _parse_ui_hierarchy(xml_text: str) -> ET.Element | None:
+    idx = xml_text.find("<hierarchy")
+    if idx == -1:
+        return None
+    idx_decl = xml_text.find("<?xml")
+    snippet = xml_text[idx_decl if idx_decl != -1 else idx :]
+    try:
+        return ET.fromstring(snippet)
+    except ET.ParseError:
+        return None
+
+
 def find_ui_node_center(
     xml_text: str,
     *,
@@ -303,14 +317,8 @@ def find_ui_node_center(
     resource_id_suffix: str | None = None,
 ) -> tuple[int, int] | None:
     """Находит центр узла в XML `uiautomator dump` по тексту, `content-desc` или `resource-id`."""
-    idx = xml_text.find("<hierarchy")
-    if idx == -1:
-        return None
-    idx_decl = xml_text.find("<?xml")
-    snippet = xml_text[idx_decl if idx_decl != -1 else idx :]
-    try:
-        root = ET.fromstring(snippet)
-    except ET.ParseError:
+    root = _parse_ui_hierarchy(xml_text)
+    if root is None:
         return None
 
     text_set = set(texts)
@@ -333,50 +341,47 @@ def find_ui_node_center(
 
 def find_happ_package_row(xml_text: str, package: str) -> tuple[tuple[int, int], bool] | None:
     """Находит строку пакета в `PerAppProxyActivity` Happ и состояние её `check_box`."""
-    idx = xml_text.find("<hierarchy")
-    if idx == -1:
-        return None
-    idx_decl = xml_text.find("<?xml")
-    snippet = xml_text[idx_decl if idx_decl != -1 else idx :]
-    try:
-        root = ET.fromstring(snippet)
-    except ET.ParseError:
+    root = _parse_ui_hierarchy(xml_text)
+    if root is None:
         return None
 
-    def _walk(parent: ET.Element) -> tuple[tuple[int, int], bool] | None:
+    # Сначала ищем строго в рамках каждого контейнера строки `:id/cl_app`,
+    # чтобы чекбокс соседней строки не перехватывал состояние целевого пакета.
+    for row in root.iter("node"):
+        if not row.attrib.get("resource-id", "").endswith(":id/cl_app"):
+            continue
         pkg_node: ET.Element | None = None
         chk_node: ET.Element | None = None
-        for child in parent:
-            rid = child.attrib.get("resource-id", "")
-            if rid.endswith(":id/package_name") and child.attrib.get("text") == package:
-                pkg_node = child
-            elif rid.endswith(":id/check_box"):
-                chk_node = child
-            for sub in child.iter("node"):
-                srid = sub.attrib.get("resource-id", "")
-                if srid.endswith(":id/package_name") and sub.attrib.get("text") == package:
-                    pkg_node = sub
-                elif srid.endswith(":id/check_box") and chk_node is None:
-                    chk_node = sub
-            if pkg_node is not None and chk_node is not None and child.attrib.get("resource-id", "").endswith(":id/cl_app"):
-                pt = _parse_bounds_center(child.attrib.get("bounds", "")) or _parse_bounds_center(
-                    pkg_node.attrib.get("bounds", "")
-                )
-                if pt is not None:
-                    return pt, chk_node.attrib.get("checked", "").lower() == "true"
+        for sub in row.iter("node"):
+            srid = sub.attrib.get("resource-id", "")
+            if srid.endswith(":id/package_name") and sub.attrib.get("text") == package:
+                pkg_node = sub
+            elif srid.endswith(":id/check_box") and chk_node is None:
+                chk_node = sub
         if pkg_node is not None and chk_node is not None:
-            pt = _parse_bounds_center(pkg_node.attrib.get("bounds", "")) or _parse_bounds_center(
-                chk_node.attrib.get("bounds", "")
+            pt = _parse_bounds_center(row.attrib.get("bounds", "")) or _parse_bounds_center(
+                pkg_node.attrib.get("bounds", "")
             )
             if pt is not None:
                 return pt, chk_node.attrib.get("checked", "").lower() == "true"
-        for child in parent:
-            found = _walk(child)
-            if found is not None:
-                return found
-        return None
 
-    return _walk(root)
+    # Fallback для упрощённой иерархии без обёртки `cl_app`: ищем общего родителя.
+    for parent in root.iter("node"):
+        direct_pkg: ET.Element | None = None
+        direct_chk: ET.Element | None = None
+        for child in parent:
+            rid = child.attrib.get("resource-id", "")
+            if rid.endswith(":id/package_name") and child.attrib.get("text") == package:
+                direct_pkg = child
+            elif rid.endswith(":id/check_box") and direct_chk is None:
+                direct_chk = child
+        if direct_pkg is not None and direct_chk is not None:
+            pt = _parse_bounds_center(direct_pkg.attrib.get("bounds", "")) or _parse_bounds_center(
+                direct_chk.attrib.get("bounds", "")
+            )
+            if pt is not None:
+                return pt, direct_chk.attrib.get("checked", "").lower() == "true"
+    return None
 
 
 def detect_happ_sigill(logcat_text: str) -> str | None:
@@ -588,11 +593,10 @@ class VpnClientsManager:
             f"mkdir -p {shlex.quote(prefs_dir)}\n"
             f"chown \"$OWNER\" {shlex.quote(prefs_dir)}\n"
             f"chmod 771 {shlex.quote(prefs_dir)}\n"
-            f"cat <<'__KOALA_XML__' > {shlex.quote(KOALA_SERVICE_XML_PATH)}\n"
-            f"{rendered}"
-            "__KOALA_XML__\n"
+            f"printf '%s' {shlex.quote(rendered)} > {shlex.quote(KOALA_SERVICE_XML_PATH)}\n"
             f"chown \"$OWNER\" {shlex.quote(KOALA_SERVICE_XML_PATH)}\n"
             f"chmod 660 {shlex.quote(KOALA_SERVICE_XML_PATH)}\n"
+            f"restorecon -R {shlex.quote(prefs_dir)} 2>/dev/null || true\n"
         )
         self._run_shell_script(script)
 
@@ -618,9 +622,12 @@ class VpnClientsManager:
             "set -e\n"
             f"OWNER=$(stat -c '%u:%g' {shlex.quote(app_dir)})\n"
             f"mkdir -p {shlex.quote(files_dir)}\n"
+            f"chown \"$OWNER\" {shlex.quote(files_dir)}\n"
+            f"chmod 771 {shlex.quote(files_dir)}\n"
             f"printf '%s\\n' {shlex.quote(payload)} > {shlex.quote(HAPP_STATE_JSON_PATH)}\n"
             f"chown \"$OWNER\" {shlex.quote(HAPP_STATE_JSON_PATH)}\n"
             f"chmod 600 {shlex.quote(HAPP_STATE_JSON_PATH)}\n"
+            f"restorecon -R {shlex.quote(files_dir)} 2>/dev/null || true\n"
         )
         self._run_shell_script(script)
 
@@ -725,7 +732,7 @@ class VpnClientsManager:
             enc_url = urllib.parse.quote(resolved_url, safe="")
             enc_name = urllib.parse.quote(profile_name, safe="")
             deeplink = f"koala-clash://install-config?url={enc_url}&name={enc_name}"
-            self._run_shell(
+            res = self._run_shell(
                 [
                     "am",
                     "start",
@@ -735,8 +742,13 @@ class VpnClientsManager:
                     "-d",
                     deeplink,
                     KOALA_PACKAGE,
-                ]
+                ],
+                check=False,
             )
+            if res.returncode != 0:
+                raise StandError(
+                    f"Не удалось открыть deep link импорта подписки в Koala Clash (код {res.returncode})"
+                )
 
             deadline = self._monotonic() + timeout_s
             save_tapped = False
@@ -765,7 +777,7 @@ class VpnClientsManager:
                 self._sleep(2.0)
 
         deeplink = f"happ://add/{resolved_url}"
-        self._run_shell(
+        res = self._run_shell(
             [
                 "am",
                 "start",
@@ -775,8 +787,13 @@ class VpnClientsManager:
                 "-d",
                 deeplink,
                 HAPP_PACKAGE,
-            ]
+            ],
+            check=False,
         )
+        if res.returncode != 0:
+            raise StandError(
+                f"Не удалось открыть deep link импорта подписки в Happ (код {res.returncode})"
+            )
         deadline = self._monotonic() + timeout_s
         while True:
             sub_res = self._run_shell(["test", "-s", HAPP_MMKV_SUB_PATH], check=False)
@@ -926,6 +943,10 @@ class VpnClientsManager:
                         check=False,
                     )
                 self._sleep(1.0)
+
+        current_happ = self._collect_status(HAPP_CLIENT)
+        if current_happ.vpn_active and current_happ.vpn_interface:
+            return current_happ
 
         self._run_shell(["logcat", "-c"], check=False)
         self._run_shell(

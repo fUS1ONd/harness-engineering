@@ -189,13 +189,17 @@ class _FakeVpnEnv:
             return _fail(f"unexpected adb args: {rest}")
 
         cmd_str = rest[1] if len(rest) > 1 else ""
-        if "__KOALA_XML__" in cmd_str:
-            m = re.search(r"cat <<'__KOALA_XML__'[^\n]*\n(.*?)\n__KOALA_XML__", cmd_str, re.S)
+        if "service.xml" in cmd_str and "printf" in cmd_str:
+            if 'chown "$OWNER"' not in cmd_str or "chmod 771" not in cmd_str or "chmod 660" not in cmd_str:
+                return _fail("missing chown/chmod for service.xml")
+            m = re.search(r"printf '%s' (.*?) > /data/data/com\.koala\.clash/shared_prefs/service\.xml", cmd_str, re.S)
             if not m:
-                return _fail("malformed heredoc")
-            self.koala_service_xml = m.group(1) + "\n"
+                return _fail("malformed printf for service.xml")
+            self.koala_service_xml = shlex.split(m.group(1))[0]
             return _ok()
         if "app_verify_exclude.json" in cmd_str and "printf" in cmd_str:
+            if 'chown "$OWNER"' not in cmd_str or "chmod 771" not in cmd_str or "chmod 600" not in cmd_str:
+                return _fail("missing chown/chmod for happ state")
             tokens_line = next(
                 line for line in cmd_str.splitlines() if "printf" in line
             )
@@ -638,6 +642,44 @@ class VpnCliIntegrationTests(unittest.TestCase):
         rc, out, _ = self._run(fake, ["--json", "vpn", "import-subscription", "koala"])
         self.assertEqual(rc, 1)
         self.assertIn(SUBSCRIPTION_URL_ENV, json.loads(out)["error"])
+
+    def test_happ_package_row_ignores_checkbox_from_sibling_row(self) -> None:
+        xml = """<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>
+<hierarchy rotation="0">
+  <node resource-id="su.happ.proxyutility:id/rv_list_applications" bounds="[0,0][1080,1920]">
+    <node resource-id="su.happ.proxyutility:id/cl_app" bounds="[0,100][1080,200]">
+      <node resource-id="su.happ.proxyutility:id/package_name" text="ru.rumap.android" bounds="[20,120][700,180]" />
+      <node resource-id="su.happ.proxyutility:id/check_box" checked="true" bounds="[900,120][1040,180]" />
+    </node>
+    <node resource-id="su.happ.proxyutility:id/cl_app" bounds="[0,200][1080,300]">
+      <node resource-id="su.happ.proxyutility:id/package_name" text="ru.rumap.android.debug" bounds="[20,220][700,280]" />
+      <node resource-id="su.happ.proxyutility:id/check_box" checked="false" bounds="[900,220][1040,280]" />
+    </node>
+  </node>
+</hierarchy>"""
+        from app_verify.vpn_clients import find_happ_package_row, resolve_subscription_url
+
+        row = find_happ_package_row(xml, "ru.rumap.android.debug")
+        self.assertIsNotNone(row)
+        assert row is not None
+        self.assertEqual(row[0], (540, 250))
+        self.assertFalse(row[1])
+        with self.assertRaises(StandError):
+            resolve_subscription_url("https://sub.example.test/with space")
+
+    def test_happ_connect_is_idempotent_when_vpn_already_active(self) -> None:
+        fake = _FakeVpnEnv(
+            installed={HAPP_PACKAGE},
+            connectivity=(
+                "NetworkAgentInfo{network{102} nc{[ Transports: VPN Capabilities: INTERNET ]} "
+                "InterfaceName: tun0 Uids: <{0-99999}>}\n"
+            ),
+        )
+        fake.tun0_up = True
+        st = VpnClientsManager(adb_bin="/fake/adb", runner=fake, sleep_fn=lambda _: None).connect("happ")
+        self.assertTrue(st.vpn_active)
+        self.assertEqual(st.vpn_interface, "tun0")
+        self.assertFalse(any("widget.click" in " ".join(c) for c in fake.calls))
 
 
 if __name__ == "__main__":
