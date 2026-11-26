@@ -400,6 +400,10 @@ def detect_happ_sigill(logcat_text: str) -> str | None:
     return None
 
 
+class HappSigillError(StandError):
+    pass
+
+
 class VpnClientsManager:
     """Управление установкой, подпиской, исключениями и `tun0` для Koala Clash и Happ."""
 
@@ -948,7 +952,8 @@ class VpnClientsManager:
         if current_happ.vpn_active and current_happ.vpn_interface:
             return current_happ
 
-        self._run_shell(["logcat", "-c"], check=False)
+        log_command = ["logcat", "-d", "-v", "threadtime"]
+        previous_lines = set(self._run_shell(log_command).stdout_text.splitlines())
         self._run_shell(
             [
                 "am",
@@ -964,11 +969,12 @@ class VpnClientsManager:
             st = self._collect_status(HAPP_CLIENT)
             if st.vpn_active and st.vpn_interface:
                 return st
-            log_res = self._run_shell(["logcat", "-d", "-v", "brief"], check=False)
-            sigill_diag = detect_happ_sigill(log_res.stdout_text)
+            log_res = self._run_shell(log_command)
+            fresh_lines = (line for line in log_res.stdout_text.splitlines() if line not in previous_lines)
+            sigill_diag = detect_happ_sigill("\n".join(fresh_lines))
             if sigill_diag is not None:
                 self._run_shell(["am", "force-stop", HAPP_PACKAGE], check=False)
-                raise StandError(sigill_diag)
+                raise HappSigillError(sigill_diag)
             if self._monotonic() >= deadline:
                 self._run_shell(["am", "force-stop", HAPP_PACKAGE], check=False)
                 raise StandTimeoutError(f"Таймаут поднятия `tun0` в Happ ({timeout_s}s)")

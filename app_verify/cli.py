@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, TextIO
 
 from .android import ALLOWED_HDD_ROOT, AndroidKvmAdapter, AndroidStandConfig
+from .bs_matrix import SCENARIOS, run_bs_matrix
 from .core import AdapterRegistry, PlatformAdapter, StandError
 from .debug_hooks import DEFAULT_DEBUG_PACKAGE, DebugHooksClient
 from .issues import (
@@ -93,6 +94,16 @@ def _build_parser() -> argparse.ArgumentParser:
     p_start.add_argument("--no-reset", action="store_true", help="Не откатывать уже запущенный эмулятор к снапшоту")
 
     sub.add_parser("stop", aliases=["down"], help="Остановить стенд и закрыть SSH-туннель")
+    p_matrix = sub.add_parser("bs-matrix", help="Прогнать матрицу БС на Android KVM")
+    p_matrix.add_argument("--apk", type=Path, required=True, help="Путь к debug APK rumap-android")
+    p_matrix.add_argument("--output", type=Path, help="Сохранить JSON-отчёт")
+    p_matrix.add_argument("--json", action="store_true", default=argparse.SUPPRESS, dest="as_json")
+    p_matrix.add_argument("--subscription-url", help=f"Подписка VPN (или {SUBSCRIPTION_URL_ENV})")
+    p_matrix.add_argument("--scenario", action="append", choices=SCENARIOS, help="Сценарий, можно указать несколько раз")
+    p_matrix.add_argument("--allow-ip", action="append", help="Дополнительный IPv4 в белом списке")
+    p_matrix.add_argument("--phase-timeout", type=float, default=90, help="Таймаут ожидания фазы в секундах")
+    p_matrix.add_argument("--manual-target", default="ya.ru", help="IP, подсеть или домен для ручной проверки")
+
     sub.add_parser("status", help="Показать статус стенда, туннеля и устройства")
 
     p_install = sub.add_parser("install", help="Установить debug APK / артефакт приложения")
@@ -432,6 +443,22 @@ def run_cli(
                 "adb_timeout": args.adb_timeout,
             }
         adapter = reg.create(args.platform, **adapter_kwargs)
+
+        if args.command == "bs-matrix":
+            if not isinstance(adapter, AndroidKvmAdapter):
+                raise StandError("Матрица БС поддерживает Android KVM")
+            report = run_bs_matrix(
+                adapter, apk=args.apk, scenarios=args.scenario, subscription_url=args.subscription_url,
+                allow_ips=args.allow_ip, phase_timeout=args.phase_timeout, manual_target=args.manual_target,
+            )
+            if args.output:
+                try:
+                    args.output.parent.mkdir(parents=True, exist_ok=True)
+                    args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+                except OSError as exc:
+                    raise StandError(f"Не удалось записать отчёт: {exc}") from exc
+            _emit(report, as_json=args.as_json, stream=out)
+            return report["exit_code"]
 
         if args.command == "prepare":
             _emit(adapter.prepare().to_dict(), as_json=args.as_json, stream=out)

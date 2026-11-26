@@ -121,6 +121,42 @@ python3 scripts/app-verify.py --json stop
 
 > **Известное ограничение Happ на `x86_64` эмуляторе:** в релизах `Happ-proxy/happ-android` (проверены `4.11.2` и `4.12.0/Happ_beta.apk`) отсутствуют нативные библиотеки `x86_64` — внутри APK есть только `arm64-v8a` и `armeabi-v7a`. На эмуляторе `verify-api34` (`x86_64`) UI Happ, `happ://add/<url>` и `PerAppProxyActivity` работают штатно, но при старте `HappVpnService` процесс `su.happ.proxyutility:XRayDaemon` (`arm64-v8a/libgojni.so`) падает с `Fatal signal 4 (SIGILL)` на инструкции `MRS X1, CNTFRQ_EL0` (`0xd53be001`) под `libndk_translation`. Команда `vpn connect happ` автоматически распознаёт `SIGILL`, останавливает цикл перезапуска сервиса (`am force-stop`) и возвращает диагностическую ошибку; полная проверка `tun0` на `x86_64` эмуляторе выполняется через **Koala Clash**, а живой туннель Happ — на физическом ARM64-устройстве.
 
+## Матрица БС для debug APK rumap-android
+
+```bash
+python3 scripts/app-verify.py --json bs-matrix \
+  --apk /path/to/app-debug.apk --output .scratch/bs-matrix.json
+```
+
+Команда откатывает KVM-эмулятор `ssh home` к `clean-base`, устанавливает APK и запускает
+наблюдение. По умолчанию проверяются все сценарии:
+
+| `--scenario` | Проверка |
+| --- | --- |
+| `cellular-phases` | Foreground без VPN, Wi-Fi выключен. `OFF → SOFT → HARD → DOWN → OFF`. Кнопка «Проверить статус сети» запускает свежий раунд при переходе из `OFF`. |
+| `wifi-cellular` | Обе сети подключены. Сотовый профиль `soft` виден приложению при активном Wi-Fi. |
+| `wifi-toggle` | Wi-Fi включается и выключается при действующем сотовом профиле `soft`. |
+| `manual-check` | В `SOFT` форма на вкладке «Проверка» выдаёт классификацию для домена. Цель можно задать через `--manual-target`. |
+| `koala-accept-all` | Активный `tun0`, режим `AcceptAll` и конфликт `VPN_BLOCKED` или `VPN_LEAK` в приложении. |
+| `koala-excluded` | Активный `tun0`, режим `DenySelected` и свежий сотовый раунд `SOFT` без конфликта. |
+| `doze-resume` | HOME и подтверждённый глубокий Doze, применение `soft` в фоне и свежий раунд после возврата. |
+| `cold-start` | Подтверждённый `force-stop`, холодный старт во время `soft`. |
+| `happ` | Подготовка, импорт, запуск реального клиента. ARM-only APK на x86_64 получает `skipped` при обнаруженном `SIGILL`. На ARM64 ветка с тем же клиентом проверяет туннель с исключением и без. |
+
+Повторяемый `--scenario` выбирает подмножество. `--allow-ip` расширяет белый список стенда,
+`--phase-timeout` задаёт предел ожидания нового раунда (90 секунд по умолчанию).
+Для VPN передайте `--subscription-url` или `APP_VERIFY_VPN_SUBSCRIPTION_URL`. При наличии
+конфигурации Remnawave как у `vpn-e2e-stand.py` команда создаст временного пользователя,
+удалит его и проверит отсутствие через API панели.
+
+В отчёте сохраняются SHA-256 APK, фактическая топология, результаты `dump-diagnostics`,
+поориентирные ответы из `diag.log` и проверка `0 crash / 0 ANR` для пакета приложения.
+Тапы выполняются по accessibility-дереву Mobile MCP. При ошибке чтения используется
+UIAutomator через ADB. В поле `cleanup` видны результаты отключения VPN, `net reset`
+и проверки остановки эмулятора с SSH-туннелем. Очистка выполняется также при `SIGINT`
+и `SIGTERM`. Код выхода `2` означает провал сценария, стенда, инварианта или очистки,
+`130` / `143` означают прерывание.
+
 ## Конфигурация UI-драйвера и переменные окружения
 
 На VPS `adb` установлен в `/opt/android-sdk/platform-tools/adb` и по умолчанию отсутствует в `PATH` и `ANDROID_HOME`. Все команды `ui-driver` автоматически формируют и передают процессу `@mobilenext/mobile-mcp` следующее окружение:
