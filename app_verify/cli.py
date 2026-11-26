@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, TextIO
 
 from .android import ALLOWED_HDD_ROOT, AndroidKvmAdapter, AndroidStandConfig
+from .bs_matrix import SCENARIOS, run_bs_matrix
 from .core import AdapterRegistry, PlatformAdapter, StandError
 from .debug_hooks import DEFAULT_DEBUG_PACKAGE, DebugHooksClient
 from .issues import (
@@ -21,7 +22,9 @@ from .issues import (
     fetch_open_issues,
     load_open_issues,
 )
+from .net_emulation import PROFILES, WIFI_ACTIONS, NetEmulationClient
 from .report import load_verification_report, render_chat_summary, render_markdown_report
+from .vpn_clients import SUBSCRIPTION_URL_ENV, VPN_CLIENTS, VpnClientsManager
 from .ui_driver import (
     DEFAULT_MOBILE_MCP_PACKAGE,
     build_mcp_server_config,
@@ -91,6 +94,16 @@ def _build_parser() -> argparse.ArgumentParser:
     p_start.add_argument("--no-reset", action="store_true", help="Не откатывать уже запущенный эмулятор к снапшоту")
 
     sub.add_parser("stop", aliases=["down"], help="Остановить стенд и закрыть SSH-туннель")
+    p_matrix = sub.add_parser("bs-matrix", help="Прогнать матрицу БС на Android KVM")
+    p_matrix.add_argument("--apk", type=Path, required=True, help="Путь к debug APK rumap-android")
+    p_matrix.add_argument("--output", type=Path, help="Сохранить JSON-отчёт")
+    p_matrix.add_argument("--json", action="store_true", default=argparse.SUPPRESS, dest="as_json")
+    p_matrix.add_argument("--subscription-url", help=f"Подписка VPN (или {SUBSCRIPTION_URL_ENV})")
+    p_matrix.add_argument("--scenario", action="append", choices=SCENARIOS, help="Сценарий, можно указать несколько раз")
+    p_matrix.add_argument("--allow-ip", action="append", help="Дополнительный IPv4 в белом списке")
+    p_matrix.add_argument("--phase-timeout", type=float, default=90, help="Таймаут ожидания фазы в секундах")
+    p_matrix.add_argument("--manual-target", default="ya.ru", help="IP, подсеть или домен для ручной проверки")
+
     sub.add_parser("status", help="Показать статус стенда, туннеля и устройства")
 
     p_install = sub.add_parser("install", help="Установить debug APK / артефакт приложения")
@@ -185,6 +198,105 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     _add_debug_common_args(p_dbg_dump)
 
+    p_net = sub.add_parser(
+        "net",
+        help="Программная эмуляция БС (off/soft/hard/down) и управление Wi-Fi/сотовой на стенде",
+    )
+    net_sub = p_net.add_subparsers(dest="net_command", required=True)
+
+    p_net_profile = net_sub.add_parser("profile", help="Применить профиль БС к сотовому интерфейсу")
+    p_net_profile.add_argument("profile", choices=PROFILES, help="Профиль: off, soft, hard или down")
+    p_net_profile.add_argument(
+        "--allow-ip",
+        action="append",
+        default=[],
+        dest="allow_ip",
+        metavar="IP",
+        help="Дополнительный IPv4 в белый список (можно повторить или перечислить через запятую)",
+    )
+    p_net_profile.add_argument(
+        "--wifi",
+        choices=WIFI_ACTIONS,
+        default=None,
+        help="Включить (on) или выключить (off) Wi-Fi",
+    )
+    _add_net_common_args(p_net_profile)
+
+    p_net_status = net_sub.add_parser("status", help="Показать текущий профиль БС, Wi-Fi, сотовую сеть и VPN")
+    _add_net_common_args(p_net_status)
+
+    p_net_reset = net_sub.add_parser("reset", help="Снять ограничения БС и вернуть Wi-Fi в исходное состояние")
+    _add_net_common_args(p_net_reset)
+
+    p_vpn = sub.add_parser(
+        "vpn",
+        help="Автоматизация реальных VPN-клиентов (Koala Clash и Happ) на Android-стенде",
+    )
+    vpn_sub = p_vpn.add_subparsers(dest="vpn_command", required=True)
+
+    p_vpn_prep = vpn_sub.add_parser(
+        "prepare",
+        help="Установить APK (опционально) и выдать ACTIVATE_VPN для VPN-клиента",
+    )
+    p_vpn_prep.add_argument("client", help=f"VPN-клиент ({'|'.join(VPN_CLIENTS)})")
+    p_vpn_prep.add_argument(
+        "--apk",
+        default=None,
+        help="Путь к APK (локальный или на HDD ssh home `/mnt/data/android/apks/...`)",
+    )
+    _add_net_common_args(p_vpn_prep)
+
+    p_vpn_imp = vpn_sub.add_parser(
+        "import-subscription",
+        help=f"Импортировать подписку из --url или `{SUBSCRIPTION_URL_ENV}`",
+    )
+    p_vpn_imp.add_argument("client", help=f"VPN-клиент ({'|'.join(VPN_CLIENTS)})")
+    p_vpn_imp.add_argument(
+        "--url",
+        default=None,
+        help=f"URL подписки (если не задан — читается из `{SUBSCRIPTION_URL_ENV}`)",
+    )
+    p_vpn_imp.add_argument("--name", default="verify", help="Имя профиля подписки (по умолчанию: verify)")
+    p_vpn_imp.add_argument("--timeout", type=float, default=90.0, help="Таймаут завершения импорта (сек)")
+    _add_net_common_args(p_vpn_imp)
+
+    p_vpn_exc = vpn_sub.add_parser(
+        "set-exclude",
+        help="Переключить режим исключений (Split Tunneling / Per-App Proxy)",
+    )
+    p_vpn_exc.add_argument("client", help=f"VPN-клиент ({'|'.join(VPN_CLIENTS)})")
+    p_vpn_exc.add_argument(
+        "--package",
+        action="append",
+        default=[],
+        dest="exclude_packages",
+        metavar="PKG",
+        help="Пакет для исключения из VPN (по умолчанию ru.rumap.android.debug; можно повторить)",
+    )
+    p_vpn_exc.add_argument(
+        "--clear",
+        action="store_true",
+        help="Отключить исключения и пустить весь трафик в общий VPN (AcceptAll / Off)",
+    )
+    _add_net_common_args(p_vpn_exc)
+
+    p_vpn_conn = vpn_sub.add_parser("connect", help="Включить VPN и дождаться поднятия tun0")
+    p_vpn_conn.add_argument("client", help=f"VPN-клиент ({'|'.join(VPN_CLIENTS)})")
+    p_vpn_conn.add_argument("--timeout", type=float, default=30.0, help="Таймаут поднятия tun0 (сек)")
+    _add_net_common_args(p_vpn_conn)
+
+    p_vpn_disc = vpn_sub.add_parser("disconnect", help="Выключить VPN и дождаться исчезновения tun0")
+    p_vpn_disc.add_argument("client", help=f"VPN-клиент ({'|'.join(VPN_CLIENTS)})")
+    p_vpn_disc.add_argument("--timeout", type=float, default=20.0, help="Таймаут отключения tun0 (сек)")
+    _add_net_common_args(p_vpn_disc)
+
+    p_vpn_stat = vpn_sub.add_parser(
+        "status",
+        help="Показать установку пакета, ACTIVATE_VPN, состояние tun0 и исключения",
+    )
+    p_vpn_stat.add_argument("client", help=f"VPN-клиент ({'|'.join(VPN_CLIENTS)})")
+    _add_net_common_args(p_vpn_stat)
+
     p_report = sub.add_parser("report", help="Сгенерировать Markdown/JSON отчёт верификации из run.json")
     p_report.add_argument("--input", required=True, help="Путь к run.json с результатами прогона")
     p_report.add_argument("--open-issues", default=None, help="JSON открытых issue для секции кандидатов")
@@ -256,6 +368,17 @@ def _add_debug_common_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_net_common_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--device", default=None, help="ADB serial устройства (по умолчанию 127.0.0.1:<local_adb_port>)")
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        default=argparse.SUPPRESS,
+        help="Вывод в формате JSON",
+    )
+
+
 def _emit(payload: dict[str, Any], *, as_json: bool, stream: TextIO) -> None:
     if as_json:
         stream.write(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
@@ -291,6 +414,12 @@ def run_cli(
     if args.command == "debug":
         return _run_debug_cli(args, out=out, err=err)
 
+    if args.command == "net":
+        return _run_net_cli(args, out=out, err=err)
+
+    if args.command == "vpn":
+        return _run_vpn_cli(args, out=out, err=err)
+
     if args.command == "report":
         return _run_report_cli(args, out=out, err=err)
 
@@ -314,6 +443,22 @@ def run_cli(
                 "adb_timeout": args.adb_timeout,
             }
         adapter = reg.create(args.platform, **adapter_kwargs)
+
+        if args.command == "bs-matrix":
+            if not isinstance(adapter, AndroidKvmAdapter):
+                raise StandError("Матрица БС поддерживает Android KVM")
+            report = run_bs_matrix(
+                adapter, apk=args.apk, scenarios=args.scenario, subscription_url=args.subscription_url,
+                allow_ips=args.allow_ip, phase_timeout=args.phase_timeout, manual_target=args.manual_target,
+            )
+            if args.output:
+                try:
+                    args.output.parent.mkdir(parents=True, exist_ok=True)
+                    args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+                except OSError as exc:
+                    raise StandError(f"Не удалось записать отчёт: {exc}") from exc
+            _emit(report, as_json=args.as_json, stream=out)
+            return report["exit_code"]
 
         if args.command == "prepare":
             _emit(adapter.prepare().to_dict(), as_json=args.as_json, stream=out)
@@ -494,6 +639,97 @@ def _run_debug_cli(args: argparse.Namespace, *, out: TextIO, err: TextIO) -> int
             raise StandError(f"Неизвестная подкоманда debug: {args.debug_command}")
 
         _emit(res.to_dict(), as_json=args.as_json, stream=out)
+        return 0
+    except StandError as exc:
+        if args.as_json:
+            _emit({"ok": False, "error": str(exc)}, as_json=True, stream=out)
+        else:
+            err.write(f"Ошибка: {exc}\n")
+        return 1
+
+
+def _run_net_cli(args: argparse.Namespace, *, out: TextIO, err: TextIO) -> int:
+    device_id = args.device or f"127.0.0.1:{args.local_adb_port}"
+    try:
+        if args.platform.strip().lower() != "android":
+            raise StandError(
+                f"Профили БС поддерживаются только для платформы 'android', получено: {args.platform!r}"
+            )
+        client = NetEmulationClient(
+            device=device_id,
+            adb_bin=args.adb_bin,
+            timeout_s=args.adb_timeout,
+        )
+        if args.net_command == "profile":
+            status = client.apply_profile(
+                args.profile,
+                allow_ips=args.allow_ip,
+                wifi=args.wifi,
+            )
+        elif args.net_command == "status":
+            status = client.status()
+        elif args.net_command == "reset":
+            status = client.reset()
+        else:
+            raise StandError(f"Неизвестная подкоманда net: {args.net_command}")
+
+        _emit(status.to_dict(), as_json=args.as_json, stream=out)
+        return 0
+    except StandError as exc:
+        if args.as_json:
+            _emit({"ok": False, "error": str(exc)}, as_json=True, stream=out)
+        else:
+            err.write(f"Ошибка: {exc}\n")
+        return 1
+
+
+def _run_vpn_cli(args: argparse.Namespace, *, out: TextIO, err: TextIO) -> int:
+    device_id = args.device or f"127.0.0.1:{args.local_adb_port}"
+    try:
+        if args.platform.strip().lower() != "android":
+            raise StandError(
+                f"Управление VPN-клиентами поддерживается только для платформы 'android', получено: {args.platform!r}"
+            )
+        manager = VpnClientsManager(
+            device=device_id,
+            adb_bin=args.adb_bin,
+            timeout_s=args.adb_timeout,
+            ssh_host=args.ssh_host,
+            remote_root=args.remote_root,
+            console_port=args.console_port,
+            remote_adb_server_port=args.remote_adb_server_port,
+        )
+        if args.vpn_command == "prepare":
+            status = manager.prepare(args.client, apk=args.apk)
+        elif args.vpn_command == "import-subscription":
+            if args.timeout <= 0:
+                raise StandError(f"--timeout должен быть больше 0, получено: {args.timeout}")
+            status = manager.import_subscription(
+                args.client,
+                url=args.url,
+                name=args.name,
+                timeout_s=args.timeout,
+            )
+        elif args.vpn_command == "set-exclude":
+            status = manager.set_exclude(
+                args.client,
+                packages=args.exclude_packages,
+                clear=args.clear,
+            )
+        elif args.vpn_command == "connect":
+            if args.timeout <= 0:
+                raise StandError(f"--timeout должен быть больше 0, получено: {args.timeout}")
+            status = manager.connect(args.client, timeout_s=args.timeout)
+        elif args.vpn_command == "disconnect":
+            if args.timeout <= 0:
+                raise StandError(f"--timeout должен быть больше 0, получено: {args.timeout}")
+            status = manager.disconnect(args.client, timeout_s=args.timeout)
+        elif args.vpn_command == "status":
+            status = manager.status(args.client)
+        else:
+            raise StandError(f"Неизвестная подкоманда vpn: {args.vpn_command}")
+
+        _emit(status.to_dict(), as_json=args.as_json, stream=out)
         return 0
     except StandError as exc:
         if args.as_json:
