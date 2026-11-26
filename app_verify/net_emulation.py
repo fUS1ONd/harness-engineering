@@ -40,9 +40,10 @@ _SAFETY_RULES: tuple[tuple[str, ...], ...] = (
     ("-d", "10.0.2.0/24", "-j", "RETURN"),
 )
 
-_INTERFACE_RE = re.compile(r"^[a-zA-Z0-9_.:-]+$")
+_INTERFACE_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.:-]*$")
 _FORBIDDEN_EXACT = frozenset({"lo", "wlan0"})
 _FORBIDDEN_PREFIXES = ("tun", "wlan")
+_ICMP_ECHO_REQUEST_TYPES = frozenset({"echo-request", "8", "8/0"})
 _NETWORK_BLOCK_RE = re.compile(r"NetworkAgentInfo\s*\{")
 _TRANSPORTS_RE = re.compile(r"Transports:\s*([^\n\]]*)", re.IGNORECASE)
 _INTERFACE_RE_LINE = re.compile(r"InterfaceName:\s*([^\s,}\]]+)")
@@ -215,14 +216,13 @@ def parse_connectivity(text: str) -> ConnectivitySnapshot:
 
         if _has_transport(transports, "VPN"):
             vpn_active = True
-            if vpn_interface is None and interfaces:
-                vpn_interface = interfaces[0]
-
-    if vpn_interface is None:
-        tun_match = _TUN_RE.search(text)
-        if tun_match is not None:
-            vpn_active = True
-            vpn_interface = tun_match.group(1)
+            if vpn_interface is None:
+                if interfaces:
+                    vpn_interface = interfaces[0]
+                else:
+                    tun_match = _TUN_RE.search(segment)
+                    if tun_match is not None:
+                        vpn_interface = tun_match.group(1)
 
     return ConnectivitySnapshot(
         cell_interface=cell_interface,
@@ -279,19 +279,23 @@ def _jump(tokens: Sequence[str]) -> str | None:
     return _option_value(tokens, "-j") or _option_value(tokens, "--jump")
 
 
+def _proto(tokens: Sequence[str]) -> str | None:
+    return _option_value(tokens, "-p") or _option_value(tokens, "--protocol")
+
+
 def _matches(
     tokens: Sequence[str],
     *,
     proto: str | None = None,
     dport: str | None = None,
-    icmp_type: str | None = None,
+    icmp_types: frozenset[str] | None = None,
     jump: str | None = None,
 ) -> bool:
-    if proto is not None and proto not in tokens:
+    if proto is not None and _proto(tokens) != proto:
         return False
     if dport is not None and _option_value(tokens, "--dport") != dport:
         return False
-    if icmp_type is not None and _option_value(tokens, "--icmp-type") != icmp_type:
+    if icmp_types is not None and _option_value(tokens, "--icmp-type") not in icmp_types:
         return False
     if jump is not None and _jump(tokens) != jump:
         return False
@@ -312,13 +316,13 @@ def detect_profile(rule_lines: Sequence[str]) -> str:
         _matches(tokens, proto="tcp", dport="443", jump="RETURN") for tokens in rules
     )
     tcp_drop = any(_matches(tokens, proto="tcp", dport="443", jump="DROP") for tokens in rules)
-    icmp_rules = [tokens for tokens in rules if "icmp" in tokens]
+    icmp_rules = [tokens for tokens in rules if _proto(tokens) == "icmp"]
     icmp_return = any(
-        _matches(tokens, proto="icmp", icmp_type="echo-request", jump="RETURN")
+        _matches(tokens, proto="icmp", icmp_types=_ICMP_ECHO_REQUEST_TYPES, jump="RETURN")
         for tokens in icmp_rules
     )
     icmp_drop = any(
-        _matches(tokens, proto="icmp", icmp_type="echo-request", jump="DROP")
+        _matches(tokens, proto="icmp", icmp_types=_ICMP_ECHO_REQUEST_TYPES, jump="DROP")
         for tokens in icmp_rules
     )
 
@@ -339,14 +343,19 @@ def extract_allowed_ips(rule_lines: Sequence[str]) -> tuple[str, ...]:
         if _jump(tokens) != "RETURN":
             continue
         destination = _option_value(tokens, "-d") or _option_value(tokens, "--destination")
-        if not destination or "/" in destination:
+        if not destination:
+            continue
+        # Реальный `iptables -S` выводит одиночные хосты с маской `/32`.
+        if destination.endswith("/32"):
+            destination = destination[:-3]
+        if "/" in destination:
             continue
         try:
-            ipaddress.IPv4Address(destination)
+            normalized = str(ipaddress.IPv4Address(destination))
         except ipaddress.AddressValueError:
             continue
-        if destination not in result:
-            result.append(destination)
+        if normalized not in result:
+            result.append(normalized)
     return tuple(result)
 
 
@@ -388,7 +397,8 @@ class NetEmulationClient:
         return self._run_adb(["shell", shlex.join(list(argv))], check=check)
 
     def _iptables(self, *argv: str, check: bool = True) -> CommandResult:
-        return self._run_shell(["iptables", *argv], check=check)
+        # `-w 5` защищает от гонки за xtables lock с `netd` при смене сети на Android.
+        return self._run_shell(["iptables", "-w", "5", *argv], check=check)
 
     def _ensure_root(self) -> None:
         root = self._run_adb(["root"], check=False)
@@ -431,10 +441,10 @@ class NetEmulationClient:
         if output.returncode == 0:
             for line in output.stdout_text.splitlines():
                 stripped = line.strip()
-                if not stripped.startswith("-A OUTPUT") or CHAIN_NAME not in stripped:
+                if not stripped.startswith("-A OUTPUT"):
                     continue
                 tokens = _rule_tokens(stripped)
-                if tokens[:2] != ["-A", "OUTPUT"]:
+                if tokens[:2] != ["-A", "OUTPUT"] or _jump(tokens) != CHAIN_NAME:
                     continue
                 self._iptables("-D", "OUTPUT", *tokens[2:], check=False)
         self._iptables("-F", CHAIN_NAME, check=False)

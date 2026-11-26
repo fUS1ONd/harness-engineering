@@ -62,8 +62,36 @@ def _fail(message: str = "error") -> CommandResult:
     return CommandResult(returncode=1, stdout=b"", stderr=message.encode())
 
 
+def _format_iptables_s_rule(rule: list[str]) -> str:
+    """Форматирует правило в каноническом виде реального `iptables -S` на Android."""
+    formatted: list[str] = []
+    idx = 0
+    while idx < len(rule):
+        token = rule[idx]
+        if token == "-d" and idx + 1 < len(rule):
+            dest = rule[idx + 1]
+            if "/" not in dest:
+                dest = f"{dest}/32"
+            formatted.extend(["-d", dest])
+            idx += 2
+            continue
+        if token == "-p" and idx + 1 < len(rule):
+            proto = rule[idx + 1]
+            formatted.extend(["-p", proto, "-m", proto])
+            idx += 2
+            continue
+        if token == "--icmp-type" and idx + 1 < len(rule):
+            icmp_type = "8" if rule[idx + 1] == "echo-request" else rule[idx + 1]
+            formatted.extend(["--icmp-type", icmp_type])
+            idx += 2
+            continue
+        formatted.append(token)
+        idx += 1
+    return " ".join(formatted)
+
+
 def _rule_lines(rules: list[list[str]]) -> list[str]:
-    return [f"-A {CHAIN_NAME} " + " ".join(rule) for rule in rules]
+    return [f"-A {CHAIN_NAME} " + _format_iptables_s_rule(rule) for rule in rules]
 
 
 class _FakeAdb:
@@ -124,6 +152,10 @@ class _FakeAdb:
 
     def _iptables(self, argv: list[str]) -> CommandResult:
         self.iptables_calls.append(list(argv))
+        if argv[:1] == ["-w"]:
+            if len(argv) < 2:
+                return _fail("iptables: option -w requires an argument")
+            argv = argv[2:] if argv[1].isdigit() else argv[1:]
 
         if argv[:1] == ["-S"]:
             target = argv[1]
@@ -135,7 +167,7 @@ class _FakeAdb:
             if chain is None:
                 return _fail("iptables: No chain/target/match by that name.")
             lines = [f"-N {target}"]
-            lines.extend(f"-A {target} " + " ".join(rule) for rule in chain)
+            lines.extend(f"-A {target} " + _format_iptables_s_rule(rule) for rule in chain)
             return _ok("\n".join(lines) + "\n")
 
         if argv[:1] == ["-N"]:
@@ -238,6 +270,16 @@ class ParseConnectivityTests(unittest.TestCase):
         self.assertTrue(snapshot.vpn_active)
         self.assertEqual(snapshot.vpn_interface, "tun0")
 
+    def test_historical_tun0_in_event_log_does_not_trigger_vpn(self) -> None:
+        text = (
+            CELL_ONLY
+            + "\nEvents:\n"
+            + "  2026-11-26T08:00:00.000 - NetworkAgentInfo[VPN] interface tun0 disconnected\n"
+        )
+        snapshot = parse_connectivity(text)
+        self.assertFalse(snapshot.vpn_active)
+        self.assertIsNone(snapshot.vpn_interface)
+
     def test_mobile_type_without_transports_still_detected(self) -> None:
         block = """  NetworkAgentInfo{network{100} nc{[ type: MOBILE[LTE] Capabilities: INTERNET ]}
     InterfaceName: radio0
@@ -254,12 +296,9 @@ class CellInterfaceValidationTests(unittest.TestCase):
                 validate_cell_interface(name)
 
     def test_rejects_unsafe_interface_name(self) -> None:
-        with self.assertRaises(StandError):
-            validate_cell_interface("rmnet;reboot")
-        with self.assertRaises(StandError):
-            validate_cell_interface("")
-        with self.assertRaises(StandError):
-            validate_cell_interface(None)
+        for bad in ("rmnet;reboot", "-j", "--help", "", None):
+            with self.subTest(bad=bad), self.assertRaises(StandError):
+                validate_cell_interface(bad)
 
     def test_accepts_known_cellular_interfaces(self) -> None:
         for name in ("rmnet_data0", "radio0", "eth0"):
@@ -490,6 +529,37 @@ class StatusTests(unittest.TestCase):
             (*DEFAULT_WHITELISTED_IPS, "1.2.3.4"),
         )
 
+    def test_parses_real_android_iptables_s_output_for_all_profiles(self) -> None:
+        real_soft = [
+            "-N RUMAP_WL",
+            "-A RUMAP_WL -d 127.0.0.0/8 -j RETURN",
+            "-A RUMAP_WL -d 10.0.2.0/24 -j RETURN",
+            "-A RUMAP_WL -d 77.88.55.242/32 -p tcp -m tcp --dport 443 -j RETURN",
+            "-A RUMAP_WL -d 1.2.3.4/32 -p tcp -m tcp --dport 443 -j RETURN",
+            "-A RUMAP_WL -p tcp -m tcp --dport 443 -j DROP",
+        ]
+        real_hard = [
+            "-N RUMAP_WL",
+            "-A RUMAP_WL -d 127.0.0.0/8 -j RETURN",
+            "-A RUMAP_WL -d 10.0.2.0/24 -j RETURN",
+            "-A RUMAP_WL -p tcp -m tcp --dport 443 -j DROP",
+            "-A RUMAP_WL -d 77.88.55.242/32 -p icmp -m icmp --icmp-type 8 -j RETURN",
+            "-A RUMAP_WL -p icmp -m icmp --icmp-type 8 -j DROP",
+        ]
+        real_down = [
+            "-N RUMAP_WL",
+            "-A RUMAP_WL -d 127.0.0.0/8 -j RETURN",
+            "-A RUMAP_WL -d 10.0.2.0/24 -j RETURN",
+            "-A RUMAP_WL -p tcp -m tcp --dport 443 -j DROP",
+            "-A RUMAP_WL -p icmp -m icmp --icmp-type 8/0 -j DROP",
+        ]
+        self.assertEqual(detect_profile(real_soft), "soft")
+        self.assertEqual(extract_allowed_ips(real_soft), ("77.88.55.242", "1.2.3.4"))
+        self.assertEqual(detect_profile(real_hard), "hard")
+        self.assertEqual(extract_allowed_ips(real_hard), ("77.88.55.242",))
+        self.assertEqual(detect_profile(real_down), "down")
+        self.assertEqual(extract_allowed_ips(real_down), ())
+
     def test_status_to_dict_contains_expected_keys(self) -> None:
         fake = _FakeAdb(connectivity=CELL_WIFI_VPN, chain_rules=build_profile_rules("soft"))
         payload = _client(fake).status().to_dict()
@@ -534,6 +604,30 @@ class ResetTests(unittest.TestCase):
 
         self.assertEqual(status.profile, "off")
         self.assertEqual(fake.svc_calls, ["enable"])
+
+    def test_cleanup_removes_duplicate_jumps_and_preserves_other_output_rules(self) -> None:
+        fake = _FakeAdb(
+            chain_rules=build_profile_rules("soft"),
+            output_rules=[
+                ["-o", "rmnet_data0", "-j", CHAIN_NAME],
+                ["-j", "oem_out"],
+                ["-o", "radio0", "-j", CHAIN_NAME],
+                ["-o", "rmnet_data0", "-j", f"{CHAIN_NAME}_OTHER"],
+            ],
+            wifi_on=False,
+        )
+
+        status = _client(fake).reset()
+
+        self.assertEqual(status.profile, "off")
+        self.assertEqual(
+            fake.output_rules,
+            [
+                ["-j", "oem_out"],
+                ["-o", "rmnet_data0", "-j", f"{CHAIN_NAME}_OTHER"],
+            ],
+        )
+        self.assertTrue(all(call[:2] == ["-w", "5"] for call in fake.iptables_calls))
 
 
 class CliIntegrationTests(unittest.TestCase):
