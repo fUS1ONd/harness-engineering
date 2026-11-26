@@ -39,10 +39,11 @@ MANUAL_ERRORS = (
     "резолв доменов разрешён только через честный Wi-Fi",
     "Достигнут временный лимит проверок",
     "Режим сети изменился во время проверки",
+    "Время ожидания проверки истекло",
 )
 MANUAL_ATTEMPTS = 4
 MANUAL_IN_PROGRESS_LABELS = ("Проверяем…", "Отменить")
-MANUAL_IN_PROGRESS_TIMEOUT_S = 270.0
+MANUAL_IN_PROGRESS_TIMEOUT_S = 330.0
 MANUAL_RETAP_INTERVAL_S = 6.0
 MANUAL_MAX_SUBMIT_TAPS = 3
 START = "Запустить"
