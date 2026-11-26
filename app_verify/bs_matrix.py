@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -20,7 +21,6 @@ from .core import StandError
 from .debug_hooks import DEFAULT_DEBUG_PACKAGE, DebugHooksClient
 from .net_emulation import NetEmulationClient, normalize_allow_ips
 from .remnawave import TemporarySubscription
-from .ui_driver import MobileMcpClient, build_ui_driver_env, resolve_ui_driver_command
 from .vpn_clients import HappSigillError, SUBSCRIPTION_URL_ENV, VpnClientsManager, resolve_subscription_url
 
 PACKAGE = DEFAULT_DEBUG_PACKAGE
@@ -33,7 +33,11 @@ RECHECK = "Проверить статус сети"
 HOME_RECHECK = "Проверить снова"
 ROUND_MESSAGE = "раунд проверки ориентиров"
 MANUAL_CLASSES = ("Широкая", "Точечная", "Нет в белых списках")
-MANUAL_ERRORS = ("наблюдение не запущено", "Не удалось запустить ручную проверку")
+MANUAL_ERRORS = (
+    "наблюдение не запущено",
+    "Не удалось запустить ручную проверку",
+    "резолв доменов разрешён только через честный Wi-Fi",
+)
 MANUAL_ATTEMPTS = 3
 START = "Запустить"
 STOP_CALIBRATION = "Остановить"
@@ -53,6 +57,14 @@ class ScenarioSkipped(StandError):
 def require(condition: bool, reason: str) -> None:
     if not condition:
         raise StandError(reason)
+
+
+def is_domain_target(target: str) -> bool:
+    try:
+        ipaddress.ip_network(target.strip(), strict=False)
+        return False
+    except ValueError:
+        return True
 
 
 class Matrix:
@@ -76,12 +88,6 @@ class Matrix:
             **opts, ssh_host=self.config.ssh_host, remote_root=self.config.remote_root,
             console_port=self.config.console_port, remote_adb_server_port=self.config.remote_adb_server_port,
         )
-        self.ui = MobileMcpClient(
-            [*resolve_ui_driver_command(), "--stdio"],
-            env=build_ui_driver_env(adb_bin=self.adb, device_id=self.device),
-            timeout_s=15,
-        )
-        self.ui_fallback = False
         candidate = subscription_url if subscription_url is not None else os.environ.get(SUBSCRIPTION_URL_ENV)
         self.url = resolve_subscription_url(candidate) if candidate else None
         self.temporary: TemporarySubscription | None = None
@@ -116,20 +122,25 @@ class Matrix:
             time.sleep(min(2, max(0, deadline - time.monotonic())))
 
     def type_text(self, text: str) -> None:
-        if text.isascii() and text.isprintable():
-            self.shell("input", "text", text.replace(" ", "%s"))
-        else:
-            require(not self.ui_fallback, "Для Unicode-ввода нужен Mobile MCP")
-            self.ui.call_tool("mobile_type_keys", {"device": self.device, "text": text})
+        require(text.isascii() and text.isprintable(), "ADB input text поддерживает только печатаемый ASCII")
+        self.shell("input", "text", text.replace(" ", "%s"))
 
     def press(self, key: str) -> None:
         self.shell("input", "keyevent", f"KEYCODE_{key}")
 
     def adb_tree(self) -> str:
         path = f"/data/local/tmp/bs-matrix-{uuid4().hex}.xml"
-        raw = self.shell(
-            "sh", "-c", f"trap 'rm -f {path}' EXIT; uiautomator dump {path} >&2 && cat {path}",
-        )
+        try:
+            raw = self.shell(
+                "sh", "-c", f"trap 'rm -f {path}' EXIT; uiautomator dump {path} >&2 && cat {path}",
+            )
+        except StandError as exc:
+            if "Killed" in str(exc) or "already registered" in str(exc):
+                try:
+                    self.shell("sh", "-c", "pkill -f uiautomator >/dev/null 2>&1 || true")
+                except StandError:
+                    pass
+            raise
         start = raw.find("<?xml")
         end = raw.find("</hierarchy>")
         require(start >= 0 and end >= start, "UIAutomator не вернул accessibility-дерево")
@@ -143,29 +154,24 @@ class Matrix:
             if x1 >= x2 or y1 >= y2:
                 continue
             ref = f"@e{i}"
-            attrs = {"text": node.get("text"), "label": node.get("content-desc"), "id": node.get("resource-id")}
-            state = "" if node.get("enabled") == "true" else " disabled"
+            attrs = {
+                "text": node.get("text"),
+                "label": node.get("content-desc") or node.get("hint"),
+                "id": node.get("resource-id"),
+            }
+            state = "" if node.get("enabled", "true") != "false" else " disabled"
             lines.append(f"{ref} " + " ".join(
                 f"{name}={json.dumps(value, ensure_ascii=False)}" for name, value in attrs.items() if value
             ) + f" at={x1},{y1} size={x2 - x1}x{y2 - y1}" + state)
         return "\n".join(lines)
 
     def screen(self) -> str:
-        tree = ""
-        if not self.ui_fallback:
-            try:
-                tree = self.ui.call_tool("mobile_list_elements_on_screen", {"device": self.device}).text
-            except StandError as exc:
-                self.metrics["mcp_error"] = str(exc)
-                self.ui_fallback = True
-                self.ui.close()
-        if self.ui_fallback:
-            self.metrics["ui_driver"] = "adb-uiautomator"
-            try:
-                tree = self.adb_tree()
-            except (StandError, ET.ParseError) as exc:
-                self.metrics["ui_dump_error"] = str(exc)
-                tree = ""
+        self.metrics["ui_driver"] = "adb-uiautomator"
+        try:
+            tree = self.adb_tree()
+        except (StandError, ET.ParseError) as exc:
+            self.metrics["ui_dump_error"] = str(exc)
+            tree = ""
         self.metrics["last_ui"] = tree[-4000:]
         return tree
 
@@ -187,6 +193,20 @@ class Matrix:
     def tap(self, label: str) -> None:
         position = self.wait(lambda: self.ui_element(self.screen(), label), f"На экране нет элемента «{label}»", timeout=20)
         self.tap_at(position)
+
+    def tap_any(self, *labels: str) -> str:
+        def find() -> tuple[str, tuple[int, int]] | None:
+            tree = self.screen()
+            for label in labels:
+                position = self.ui_element(tree, label)
+                if position is not None:
+                    return label, position
+            return None
+
+        joined = " / ".join(f"«{label}»" for label in labels)
+        label, position = self.wait(find, f"На экране нет элемента {joined}", timeout=20)
+        self.tap_at(position)
+        return label
 
     def diagnostics(self) -> dict:
         snapshot = self.debug.dump_diagnostics().diagnostics
@@ -233,31 +253,47 @@ class Matrix:
         return True
 
     def phase(
-        self, expected: str, before: set[str], *, timeout: float | None = None, nudge: bool = False,
+        self,
+        expected: str | tuple[str, ...],
+        before: set[str],
+        *,
+        timeout: float | None = None,
+        nudge: bool = False,
+        clear_cellular: bool = False,
     ) -> dict:
+        allowed = (expected,) if isinstance(expected, str) else tuple(expected)
+        label = "/".join(allowed)
+        cellular_clears = 0
+
         def observed() -> dict | None:
+            nonlocal cellular_clears
             runtime = self.diagnostics()
+            if clear_cellular and runtime.get("network_conflict") == "CELLULAR_UNAVAILABLE" and cellular_clears < 2:
+                cellular_clears += 1
+                self.clear_conflict()
+                self.debug.navigate("check")
+                runtime = self.diagnostics()
             if (
-                nudge and expected != "OFF" and runtime.get("phase") == "OFF"
+                nudge and "OFF" not in allowed and runtime.get("phase") == "OFF"
                 and runtime.get("network_conflict") == "NONE" and runtime.get("work_status") == "RUNNING"
                 and self.nudge_recheck()
             ):
                 runtime = self.diagnostics()
             fresh = [row for row in self.rounds() if row["ts"] not in before]
             self.metrics["last_rounds"] = fresh[-3:]
-            if runtime.get("phase") != expected or runtime.get("network_conflict") != "NONE":
+            if runtime.get("phase") not in allowed or runtime.get("network_conflict") != "NONE":
                 return None
             for row in reversed(fresh):
                 fields = row["fields"]
-                if str(fields.get("phase")).upper() == expected and not fields.get("blocked_by"):
+                if str(fields.get("phase")).upper() in allowed and not fields.get("blocked_by"):
                     return row
             return None
 
         start = time.monotonic()
-        row = self.wait(observed, f"Нет свежего раунда {expected} без сетевого конфликта", timeout=timeout)
+        row = self.wait(observed, f"Нет свежего раунда {label} без сетевого конфликта", timeout=timeout)
         self.last_round_at = time.monotonic()
         self.metrics.setdefault("phases", []).append({
-            "expected": expected, "elapsed_s": round(time.monotonic() - start, 2), "round": row,
+            "expected": label, "elapsed_s": round(time.monotonic() - start, 2), "round": row,
             "diagnostics": self.metrics["last_diagnostics"],
         })
         return row["fields"]
@@ -319,16 +355,37 @@ class Matrix:
                     f"Неполный поориентирный ответ {group}",
                 )
 
+    def require_no_icmp_silence(self, fields: dict) -> None:
+        self.require_landmarks(fields)
+        for group in ("cut", "pass"):
+            for mark in fields[group]:
+                require(
+                    mark.get("modem_icmp") == "unprobed" and mark.get("modem_tcp") == "silence",
+                    f"Фаза UNKNOWN допустима только при отключённом ICMP и полном молчании TCP ({group})",
+                )
+
     def cellular_phases(self) -> None:
         self.baseline()
         before = self.cursor()
         self.profile("soft", "off")
         self.recheck()
-        self.require_landmarks(self.phase("SOFT", before, nudge=True))
-        for profile in ("hard", "down", "off"):
+        soft_fields = self.phase("SOFT", before, nudge=True)
+        self.require_landmarks(soft_fields)
+        icmp_probed = any(
+            mark.get("modem_icmp") != "unprobed"
+            for group in ("cut", "pass") for mark in soft_fields[group]
+        )
+        self.metrics["icmp_available"] = icmp_probed
+        for profile in ("hard", "down"):
             before = self.cursor()
             self.profile(profile, "off")
-            self.phase(profile.upper(), before, nudge=True)
+            expected: str | tuple[str, ...] = profile.upper() if icmp_probed else (profile.upper(), "UNKNOWN")
+            fields = self.phase(expected, before, nudge=True)
+            if str(fields.get("phase")).upper() == "UNKNOWN":
+                self.require_no_icmp_silence(fields)
+        before = self.cursor()
+        self.profile("off", "off")
+        self.phase("OFF", before, nudge=True)
         self.metrics.setdefault("recheck_nudges", 0)
 
     def wifi_cellular(self) -> None:
@@ -386,9 +443,11 @@ class Matrix:
             self.debug.navigate("check")
 
     def manual_check(self) -> None:
-        self.baseline()
+        wifi = "on" if is_domain_target(self.manual_target) else "off"
+        self.metrics["manual_wifi"] = wifi
+        self.baseline(wifi)
         before = self.cursor()
-        self.profile("soft", "off")
+        self.profile("soft", wifi)
         self.recheck()
         self.phase("SOFT", before, nudge=True)
         self.debug.navigate("check")
@@ -486,7 +545,7 @@ class Matrix:
         before = self.cursor()
         self.profile("soft", "off", vpn=True)
         self.adapter.launch(PACKAGE)
-        self.require_landmarks(self.phase("SOFT", before, nudge=True))
+        self.require_landmarks(self.phase("SOFT", before, nudge=True, clear_cellular=True))
         self.metrics["network_conflict"] = "NONE"
 
     def leave_idle(self) -> dict[str, str]:
@@ -575,7 +634,7 @@ class Matrix:
         before = self.cursor()
         self.profile("soft", "off", vpn=True)
         self.adapter.launch(PACKAGE)
-        self.require_landmarks(self.phase("SOFT", before, nudge=True))
+        self.require_landmarks(self.phase("SOFT", before, nudge=True, clear_cellular=True))
 
     def disconnect(self, client: str) -> dict:
         status = self.vpn.status(client)
@@ -623,8 +682,7 @@ class Matrix:
         self.wait(ready, "Сервис приложения не запустился", timeout=30)
         runtime = self.diagnostics()
         if runtime.get("battery_onboarding_required"):
-            label = "Продолжить" if self.ui_element(self.screen(), "Продолжить") else "Настроить позже"
-            self.tap(label)
+            self.tap_any("Продолжить", "Настроить позже")
         if self.diagnostics().get("region_onboarding_required"):
             self.tap("Поиск региона или округа")
             self.type_text("RU-MOW")
@@ -746,7 +804,6 @@ def run_bs_matrix(
                 report["stability"] = matrix.collect_stability()
             if matrix.temporary:
                 cleanup("temporary_user", matrix.temporary.delete)
-            cleanup("ui_driver_close", matrix.ui.close)
             if started:
                 cleanup("stop", matrix.stop)
         finally:

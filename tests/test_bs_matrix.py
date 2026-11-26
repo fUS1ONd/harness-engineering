@@ -8,6 +8,7 @@ from contextlib import ExitStack
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
+from xml.sax.saxutils import escape as xml_escape
 
 from app_verify.android import AndroidStandConfig, CommandResult
 from app_verify.bs_matrix import PACKAGE, SCENARIOS, run_bs_matrix
@@ -59,6 +60,7 @@ class FakeStand:
         self.work_status = "RUNNING"
         self.suppress_auto_round_transitions = set()
         self.target = ""
+        self.battery_onboarding = False
 
     def start(self):
         self.actions.append("start")
@@ -140,6 +142,7 @@ class FakeStand:
         return SimpleNamespace(diagnostics={"mock_preset": "clear", "runtime": {
             "phase": self.phase, "network_conflict": self.conflict, "runtime_present": True,
             "work_status": self.work_status, "vpn_active": self.active is not None,
+            "battery_onboarding_required": self.battery_onboarding,
         }})
 
     def navigate(self, tab):
@@ -148,36 +151,42 @@ class FakeStand:
         if tab != "check":
             self.check_result = False
 
-    def call_tool(self, name, arguments):
-        if name == "mobile_list_elements_on_screen":
-            if self.tab == "calibration":
-                options = ["Остановить"] if self.calibration_running else ["Подобрать скорость"]
-            else:
-                options = ["77.73.236.0/24, IP или домен", "Проверить", "Настройки VPN", "Проверить снова"]
-                if self.phase == "OFF":
-                    options.insert(0, "Проверить статус сети")
-                if self.work_status != "RUNNING":
-                    options.append("Запустить")
-                if self.target:
-                    options.append(self.target)
-                if self.manual_error:
-                    options.append(self.manual_error)
-                if self.check_result:
-                    options.append("Точечная")
-            self.elements = {i: label for i, label in enumerate(options, 1)}
-            return SimpleNamespace(text="\n".join(
-                f'@e{i} Button text="{label}" at={i},0 size=1x1' for i, label in self.elements.items()
-            ))
-        return SimpleNamespace(text="")
-
-    def close(self):
-        self.actions.append("close_ui")
+    def screen_xml(self):
+        if self.battery_onboarding:
+            options = ["Продолжить"]
+        elif self.tab == "calibration":
+            options = ["Остановить"] if self.calibration_running else ["Подобрать скорость"]
+        else:
+            options = ["77.73.236.0/24, IP или домен", "Проверить", "Настройки VPN", "Проверить снова"]
+            if self.phase == "OFF":
+                options.insert(0, "Проверить статус сети")
+            if self.work_status != "RUNNING":
+                options.append("Запустить")
+            if self.target:
+                options.append(self.target)
+            if self.manual_error:
+                options.append(self.manual_error)
+            if self.check_result:
+                options.append("Точечная")
+        self.elements = {i * 10 + 5: label for i, label in enumerate(options, 1)}
+        nodes = "".join(
+            f'<node text="{xml_escape(label)}" enabled="true" bounds="[{i * 10},0][{i * 10 + 10},10]"/>'
+            for i, label in enumerate(options, 1)
+        )
+        return f'<?xml version="1.0" encoding="UTF-8"?><hierarchy>{nodes}</hierarchy>'
 
     def command(self, argv, **_kwargs):
         args = shlex.split(argv[-1])
+        if args[:2] == ["sh", "-c"] and "uiautomator dump" in args[2]:
+            return CommandResult(0, self.screen_xml().encode())
+        if args[:2] == ["sh", "-c"] and "pkill -f uiautomator" in args[2]:
+            self.actions.append("pkill_uiautomator")
+            return CommandResult(0)
         if args[:2] == ["input", "tap"]:
             label = self.elements[int(args[2])]
             self.actions.append(("tap", label))
+            if label in {"Продолжить", "Настроить позже"}:
+                self.battery_onboarding = False
             if label == "Проверить статус сети":
                 self.round()
             if label == "Запустить":
@@ -268,9 +277,6 @@ class MatrixRunTests(unittest.TestCase):
         with ExitStack() as stack:
             for name, value in {
                 "find_local_adb": Mock(return_value="/fake/adb"),
-                "build_ui_driver_env": Mock(return_value={}),
-                "resolve_ui_driver_command": Mock(return_value=["fake-mcp"]),
-                "MobileMcpClient": Mock(return_value=stand),
                 "NetEmulationClient": Mock(return_value=SimpleNamespace(
                     status=stand.net_status, apply_profile=stand.apply_profile, reset=stand.reset,
                 )),
@@ -308,8 +314,8 @@ class MatrixRunTests(unittest.TestCase):
         self.assertFalse(stand.user)
         self.assertEqual(report["stability"]["crash_count"], 0)
         self.assertEqual(
-            stand.actions[-6:],
-            ["reset", ("logs", {"package": PACKAGE}), "delete_user", "close_ui", "stop", "status"],
+            stand.actions[-5:],
+            ["reset", ("logs", {"package": PACKAGE}), "delete_user", "stop", "status"],
         )
         self.assertNotIn("example.invalid", json.dumps(report))
 
@@ -418,6 +424,70 @@ class MatrixRunTests(unittest.TestCase):
         self.assertEqual(scenario["metrics"]["work_status_after_launch"], "PAUSED")
         self.assertEqual(scenario["metrics"]["start_button"], "Запустить")
 
+    def test_cellular_phases_accepts_unknown_when_icmp_unprobed_and_tcp_silent(self):
+        stand = FakeStand()
+
+        def no_icmp_round():
+            if not stand.process or stand.bg:
+                return
+            if stand.profile_name in ("hard", "down"):
+                stand.phase = "UNKNOWN"
+                mark = {
+                    "addr": "1.1.1.1", "wire_icmp": "unprobed", "wire_tcp": "answer",
+                    "modem_icmp": "unprobed", "modem_tcp": "silence",
+                }
+            else:
+                stand.phase = stand.profile_name.upper()
+                mark = {
+                    "addr": "1.1.1.1", "wire_icmp": "unprobed", "wire_tcp": "answer",
+                    "modem_icmp": "unprobed", "modem_tcp": "answer",
+                }
+            stand.entries.append({
+                "ts": str(len(stand.entries)), "category": "phase", "msg": "раунд проверки ориентиров",
+                "fields": {"phase": stand.phase, "took_ms": 1200, "local_ip": "10.0.2.15", "cut": [mark], "pass": [mark]},
+            })
+
+        stand.round = no_icmp_round
+        report = self.run_matrix(stand, scenarios=["cellular-phases"])
+        scenario = report["scenarios"]["cellular-phases"]
+        self.assertEqual(scenario["status"], "pass", scenario)
+        self.assertFalse(scenario["metrics"]["icmp_available"])
+        self.assertEqual(
+            [step["round"]["fields"]["phase"] for step in scenario["metrics"]["phases"]],
+            ["OFF", "SOFT", "UNKNOWN", "UNKNOWN", "OFF"],
+        )
+
+    def test_manual_check_uses_wifi_for_domain_and_cellular_only_for_ip(self):
+        stand_domain = FakeStand()
+        rep_domain = self.run_matrix(stand_domain, scenarios=["manual-check"], manual_target="ya.ru")
+        self.assertEqual(rep_domain["scenarios"]["manual-check"]["status"], "pass", rep_domain)
+        self.assertEqual(rep_domain["scenarios"]["manual-check"]["metrics"]["manual_wifi"], "on")
+        self.assertIn(("profile", "soft", "on"), stand_domain.actions)
+
+        stand_ip = FakeStand()
+        rep_ip = self.run_matrix(stand_ip, scenarios=["manual-check"], manual_target="77.88.55.242")
+        self.assertEqual(rep_ip["scenarios"]["manual-check"]["status"], "pass", rep_ip)
+        self.assertEqual(rep_ip["scenarios"]["manual-check"]["metrics"]["manual_wifi"], "off")
+        self.assertIn(("profile", "soft", "off"), stand_ip.actions)
+
+    def test_koala_excluded_recovers_from_transient_cellular_unavailable(self):
+        stand = FakeStand()
+        original_apply = stand.apply_profile
+
+        def apply_with_transient_cellular_loss(profile, *, allow_ips, wifi):
+            result = original_apply(profile, allow_ips=allow_ips, wifi=wifi)
+            if profile == "soft" and wifi == "off" and stand.active == "koala":
+                stand.conflict = "CELLULAR_UNAVAILABLE"
+                stand.phase = "OFF"
+            return result
+
+        stand.apply_profile = apply_with_transient_cellular_loss
+        report = self.run_matrix(stand, scenarios=["koala-excluded"])
+        scenario = report["scenarios"]["koala-excluded"]
+        self.assertEqual(scenario["status"], "pass", scenario)
+        self.assertEqual(scenario["metrics"]["cleared_conflicts"], ["CELLULAR_UNAVAILABLE"])
+        self.assertEqual(scenario["metrics"]["network_conflict"], "NONE")
+
 
 class SubscriptionTests(unittest.TestCase):
     def test_cleanup_looks_up_user_when_creation_response_was_lost(self):
@@ -513,28 +583,18 @@ class RemnawaveUserFormatTests(unittest.TestCase):
                 subscription.delete()
 
 
-class UiFallbackTests(unittest.TestCase):
+class UiDumpTests(unittest.TestCase):
     run_matrix = MatrixRunTests.run_matrix
 
-    def test_accessibility_fallback_runs_after_mcp_read_failure(self):
+    def test_adb_uiautomator_is_used_directly_without_mobile_mcp(self):
         stand = FakeStand()
-        stand.call_tool = Mock(side_effect=StandError("MCP UI timeout"))
-        original = stand.runner.run.side_effect
-
-        def command(argv, **kwargs):
-            if "uiautomator dump" in argv[-1]:
-                return CommandResult(0, b'<?xml version="1.0"?><hierarchy></hierarchy>')
-            return original(argv, **kwargs)
-
-        stand.runner.run.side_effect = command
         report = self.run_matrix(stand, scenarios=["happ"])
         self.assertEqual(report["verdict"], "skipped")
         self.assertEqual(report["setup_metrics"]["ui_driver"], "adb-uiautomator")
-        self.assertEqual(report["setup_metrics"]["mcp_error"], "MCP UI timeout")
+        self.assertNotIn("mcp_error", report["setup_metrics"])
 
     def test_failed_accessibility_dump_is_retried_as_empty_screen(self):
         stand = FakeStand()
-        stand.call_tool = Mock(side_effect=StandError("MCP UI timeout"))
         original = stand.runner.run.side_effect
 
         def command(argv, **kwargs):
@@ -546,3 +606,24 @@ class UiFallbackTests(unittest.TestCase):
         report = self.run_matrix(stand, scenarios=["happ"])
         self.assertEqual(report["verdict"], "skipped")
         self.assertIn("could not get idle state", report["setup_metrics"]["ui_dump_error"])
+
+    def test_killed_dump_cleans_up_uiautomator_and_battery_onboarding_retries(self):
+        stand = FakeStand()
+        stand.battery_onboarding = True
+        original = stand.runner.run.side_effect
+        attempts = {"count": 0}
+
+        def command(argv, **kwargs):
+            if "uiautomator dump" in argv[-1]:
+                attempts["count"] += 1
+                if attempts["count"] == 1:
+                    return CommandResult(137, b"", b"Killed")
+            return original(argv, **kwargs)
+
+        stand.runner.run.side_effect = command
+        with patch("app_verify.bs_matrix.time.sleep"):
+            report = self.run_matrix(stand, scenarios=["happ"])
+        self.assertEqual(report["verdict"], "skipped", report)
+        self.assertIn("pkill_uiautomator", stand.actions)
+        self.assertIn(("tap", "Продолжить"), stand.actions)
+        self.assertFalse(stand.battery_onboarding)

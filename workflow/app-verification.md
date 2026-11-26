@@ -151,8 +151,8 @@ python3 scripts/app-verify.py --json bs-matrix \
 
 В отчёте сохраняются SHA-256 APK, фактическая топология, результаты `dump-diagnostics`,
 поориентирные ответы из `diag.log` и проверка `0 crash / 0 ANR` для пакета приложения.
-Тапы выполняются по accessibility-дереву Mobile MCP. При ошибке чтения используется
-UIAutomator через ADB. В поле `cleanup` видны результаты отключения VPN, `net reset`
+Тапы выполняются по accessibility-дереву UIAutomator через ADB (`uiautomator dump` + `input tap`).
+В поле `cleanup` видны результаты отключения VPN, `net reset`
 и проверки остановки эмулятора с SSH-туннелем. Очистка выполняется также при `SIGINT`
 и `SIGTERM`. Код выхода `2` означает провал сценария, стенда, инварианта или очистки,
 `130` / `143` означают прерывание.
