@@ -38,8 +38,9 @@ MANUAL_ERRORS = (
     "Не удалось запустить ручную проверку",
     "резолв доменов разрешён только через честный Wi-Fi",
     "Достигнут временный лимит проверок",
+    "Режим сети изменился во время проверки",
 )
-MANUAL_ATTEMPTS = 3
+MANUAL_ATTEMPTS = 4
 MANUAL_IN_PROGRESS_LABELS = ("Проверяем…", "Отменить")
 MANUAL_IN_PROGRESS_TIMEOUT_S = 270.0
 MANUAL_RETAP_INTERVAL_S = 6.0
@@ -406,11 +407,12 @@ class Matrix:
         self.profile("soft", "off")
         self.recheck()
         self.phase("SOFT", before, nudge=True)
+        toggle_timeout = max(self.phase_timeout, 150.0) if self.phase_timeout >= 30 else self.phase_timeout
         for wifi in ("on", "off"):
             before = self.cursor()
             self.shell("svc", "wifi", "enable" if wifi == "on" else "disable")
             self.network("soft", wifi)
-            self.phase("SOFT", before, nudge=True)
+            self.phase("SOFT", before, timeout=toggle_timeout, nudge=True)
 
     def manual_allowed(self) -> bool:
         runtime = self.diagnostics()
@@ -489,6 +491,7 @@ class Matrix:
         self.profile("soft", wifi)
         self.recheck()
         self.phase("SOFT", before, nudge=True)
+        self.stop_calibration_if_running()
         self.debug.navigate("check")
         self.wait(self.manual_allowed, "Ручная проверка не стала доступна в фазе SOFT")
         self.tap("77.73.236.0/24, IP или домен")
@@ -512,10 +515,12 @@ class Matrix:
             errors.append({"attempt": attempt, "error": value, "diag_tail": self.diag_tail()})
             self.metrics["manual_errors"] = errors
             if attempt < MANUAL_ATTEMPTS:
-                if "Достигнут временный лимит проверок" not in value:
+                if "наблюдение не запущено" in value:
                     before = self.cursor()
-                    if "наблюдение не запущено" in value:
-                        self.stop_calibration_if_running()
+                    self.stop_calibration_if_running()
+                    self.phase("SOFT", before, nudge=True)
+                elif self.diagnostics().get("phase") != "SOFT":
+                    before = self.cursor()
                     self.phase("SOFT", before, nudge=True)
         raise StandError(f"Ручная проверка {self.manual_target} вернула ошибку: {errors[-1]['error']}")
 

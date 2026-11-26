@@ -400,10 +400,34 @@ class MatrixRunTests(unittest.TestCase):
         report = self.run_matrix(stand, scenarios=["manual-check"])
         scenario = report["scenarios"]["manual-check"]
         self.assertEqual(scenario["status"], "pass", scenario)
-        self.assertEqual(scenario["metrics"]["manual_attempts"], 2)
+        self.assertEqual(scenario["metrics"]["manual_attempts"], 1)
         self.assertEqual(scenario["metrics"]["stopped_calibration"], 1)
         self.assertEqual(scenario["metrics"]["manual_result"]["class"], "Точечная")
         self.assertIn(("tap", "Остановить"), stand.actions)
+
+    def test_manual_check_retries_on_network_mode_changed_error(self):
+        stand = FakeStand()
+        orig_command = stand.command
+        submit_taps = 0
+
+        def network_changed_first_attempt(argv, **kwargs):
+            nonlocal submit_taps
+            args = shlex.split(argv[-1])
+            if args[:2] == ["input", "tap"] and stand.elements.get(int(args[2])) == "Проверить":
+                submit_taps += 1
+                if submit_taps == 1:
+                    stand.actions.append(("tap", "Проверить"))
+                    stand.manual_error = "Режим сети изменился во время проверки — результат не отправлен."
+                    return CommandResult(0, b"", b"")
+                stand.manual_error = None
+            return orig_command(argv, **kwargs)
+
+        stand.runner.run.side_effect = network_changed_first_attempt
+        report = self.run_matrix(stand, scenarios=["manual-check"])
+        scenario = report["scenarios"]["manual-check"]
+        self.assertEqual(scenario["status"], "pass", scenario)
+        self.assertEqual(scenario["metrics"]["manual_attempts"], 2)
+        self.assertEqual(scenario["metrics"]["manual_result"]["class"], "Точечная")
 
     def test_doze_resume_holds_doze_past_debounce_window(self):
         stand = FakeStand()
