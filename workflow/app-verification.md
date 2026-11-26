@@ -33,6 +33,7 @@
   - `python3 scripts/app-verify.py --json debug dump-diagnostics [--output <local.json>] [--device-output-path <path>]` — read-only дамп диагностики приложения (локальное сохранение на VPS через `--output`; запись в `cacheDir` на устройстве через `--device-output-path`, алиас `--output-path`).
   - Все подкоманды принимают `--device <serial>` и `--package <pkg>` (по умолчанию `ru.rumap.android.debug`).
 - **Программные профили БС (`net`):** эмуляция белых списков на сотовом интерфейсе эмулятора через отдельную `iptables`-цепочку `RUMAP_WL` (подробности ниже).
+- **Реальные VPN-клиенты (`vpn`):** автоматизация установки, импорта подписок, Split Tunneling / Per-App Proxy и управления `tun0` для **Koala Clash** (`com.koala.clash`) и **Happ** (`su.happ.proxyutility`) на KVM-эмуляторе `ssh home` (подробности ниже).
 - **Отчёт и GitHub Issues:** `report` рендерит Markdown/сводку из `run.json`, `issues dedup` сверяет находки с открытыми issue, `issues create` заводит issue только после `--confirm-owner-approval` (см. ниже).
 
 ## Программная эмуляция белых списков (`net`)
@@ -73,6 +74,52 @@ python3 scripts/app-verify.py --json net reset
 создания новой цепочки, поэтому дубли не накапливаются. `net status` возвращает `profile`
 (`off`/`soft`/`hard`/`down`/`custom`), `allowed_ips`, `cell_if`, `wifi_enabled`,
 `wifi_connected`, `wifi_interface`, `cellular_connected`, `vpn_active` и `vpn_interface`.
+
+## Реальные VPN-клиенты (`vpn`: Koala Clash и Happ)
+
+Кэш совместимых APK хранится на HDD `ssh home` в `/mnt/data/android/apks/`:
+
+| Клиент (`<client>`) | Пакет | Кэш APK на `ssh home` | ABI и статус на `verify-api34` (`x86_64`) |
+| --- | --- | --- | --- |
+| `koala` | `com.koala.clash` | `/mnt/data/android/apks/koala-clash.apk` (`koalaclash-1.6.0-x86_64.apk`) | Нативный `x86_64`: полный цикл до `tun0`, `AcceptAll` и `DenySelected` |
+| `happ` | `su.happ.proxyutility` | `/mnt/data/android/apks/happ.apk` (`Happ-4.11.2.apk`) | Только `arm64-v8a` / `armeabi-v7a` (включая `4.12.0/Happ_beta.apk`): UI, импорт и Per-App Proxy работают, но `XRayDaemon` (`libgojni.so`) падает с `SIGILL` под `libndk_translation` |
+
+Подкоманды `scripts/app-verify.py vpn` (принимают `--json` глобально или локально и `--device`):
+
+- `vpn prepare <koala|happ> [--apk <path>]` — устанавливает APK (локальный файл или путь на HDD `ssh home` `/mnt/data/android/apks/...` без перекачки по WAN), выставляет `appops set <pkg> ACTIVATE_VPN allow` (+ `ACTIVATE_PLATFORM_VPN allow` и `POST_NOTIFICATIONS`) и проверяет наличие пакета.
+- `vpn import-subscription <koala|happ> [--url <url>] [--name <name>] [--timeout <sec>]` — читает URL подписки из `--url` или переменной окружения `APP_VERIFY_VPN_SUBSCRIPTION_URL` (**никогда не хардкодить URL в репо!**), открывает deep link (`koala-clash://install-config?...` с авто-тапом `Save` и ожиданием `active_profile` в `service.xml`, либо `happ://add/<url>` с ожиданием `mmkv/SUB`).
+- `vpn set-exclude <koala|happ> [--package <pkg>...] [--clear]` — включает режим исключений (`DenySelected` в `/data/data/com.koala.clash/shared_prefs/service.xml` / `Bypass` в `PerAppProxyActivity` Happ; пакет по умолчанию `ru.rumap.android.debug`), либо с `--clear` переводит в общий VPN без исключений (`AcceptAll` / `Off`). Если `koala` уже подключён, `tun0` автоматически переподнимается с обновлённым набором `Uids`.
+- `vpn connect <koala|happ> [--timeout <sec>]` — включает VPN (`ExternalControlActivity` `com.koala.clash.action.START_CLASH` / `WidgetProvider` `su.happ.proxyutility.action.widget.click`) и ждёт появления `tun0` в `dumpsys connectivity`.
+- `vpn disconnect <koala|happ> [--timeout <sec>]` — выключает VPN и дожидается исчезновения `tun0`.
+- `vpn status <koala|happ>` — возвращает `installed`, `activate_vpn`, `vpn_active`, `vpn_interface`, `exclude_mode`, `excluded_packages`, `active_profile`, `vpn_uids` и (для ARM-only APK на `x86_64`) `abi_warning`.
+
+Пример живого прогона на `ssh home` с временной подпиской Remnawave (с обязательным удалением временного пользователя и остановкой эмулятора в `finally`):
+
+```bash
+# 1. Поднять стенд и установить debug APK + Koala Clash из кэша на HDD ssh home
+python3 scripts/app-verify.py --json start
+python3 scripts/app-verify.py --json install /root/rumap-android/app/build/outputs/apk/debug/app-debug.apk
+python3 scripts/app-verify.py --json vpn prepare koala --apk /mnt/data/android/apks/koala-clash.apk
+
+# 2. Передать временную подписку через APP_VERIFY_VPN_SUBSCRIPTION_URL (созданную через API Remnawave и удаляемую в finally)
+APP_VERIFY_VPN_SUBSCRIPTION_URL="https://..." \
+  python3 scripts/app-verify.py --json vpn import-subscription koala --name verify
+
+# 3. Проверить общий VPN (AcceptAll) и VPN с исключением ru.rumap.android.debug (DenySelected)
+python3 scripts/app-verify.py --json vpn set-exclude koala --clear
+python3 scripts/app-verify.py --json vpn connect koala
+python3 scripts/app-verify.py --json net status
+
+python3 scripts/app-verify.py --json vpn set-exclude koala --package ru.rumap.android.debug
+python3 scripts/app-verify.py --json vpn status koala
+
+# 4. Обязательный cleanup: отключить VPN, сбросить правила БС и остановить эмулятор
+python3 scripts/app-verify.py --json vpn disconnect koala
+python3 scripts/app-verify.py --json net reset
+python3 scripts/app-verify.py --json stop
+```
+
+> **Известное ограничение Happ на `x86_64` эмуляторе:** в релизах `Happ-proxy/happ-android` (проверены `4.11.2` и `4.12.0/Happ_beta.apk`) отсутствуют нативные библиотеки `x86_64` — внутри APK есть только `arm64-v8a` и `armeabi-v7a`. На эмуляторе `verify-api34` (`x86_64`) UI Happ, `happ://add/<url>` и `PerAppProxyActivity` работают штатно, но при старте `HappVpnService` процесс `su.happ.proxyutility:XRayDaemon` (`arm64-v8a/libgojni.so`) падает с `Fatal signal 4 (SIGILL)` на инструкции `MRS X1, CNTFRQ_EL0` (`0xd53be001`) под `libndk_translation`. Команда `vpn connect happ` автоматически распознаёт `SIGILL`, останавливает цикл перезапуска сервиса (`am force-stop`) и возвращает диагностическую ошибку; полная проверка `tun0` на `x86_64` эмуляторе выполняется через **Koala Clash**, а живой туннель Happ — на физическом ARM64-устройстве.
 
 ## Конфигурация UI-драйвера и переменные окружения
 
