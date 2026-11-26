@@ -21,6 +21,7 @@ from .issues import (
     fetch_open_issues,
     load_open_issues,
 )
+from .net_emulation import PROFILES, WIFI_ACTIONS, NetEmulationClient
 from .report import load_verification_report, render_chat_summary, render_markdown_report
 from .ui_driver import (
     DEFAULT_MOBILE_MCP_PACKAGE,
@@ -185,6 +186,36 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     _add_debug_common_args(p_dbg_dump)
 
+    p_net = sub.add_parser(
+        "net",
+        help="Программная эмуляция БС (off/soft/hard/down) и управление Wi-Fi/сотовой на стенде",
+    )
+    net_sub = p_net.add_subparsers(dest="net_command", required=True)
+
+    p_net_profile = net_sub.add_parser("profile", help="Применить профиль БС к сотовому интерфейсу")
+    p_net_profile.add_argument("profile", choices=PROFILES, help="Профиль: off, soft, hard или down")
+    p_net_profile.add_argument(
+        "--allow-ip",
+        action="append",
+        default=[],
+        dest="allow_ip",
+        metavar="IP",
+        help="Дополнительный IPv4 в белый список (можно повторить или перечислить через запятую)",
+    )
+    p_net_profile.add_argument(
+        "--wifi",
+        choices=WIFI_ACTIONS,
+        default=None,
+        help="Включить (on) или выключить (off) Wi-Fi",
+    )
+    _add_net_common_args(p_net_profile)
+
+    p_net_status = net_sub.add_parser("status", help="Показать текущий профиль БС, Wi-Fi, сотовую сеть и VPN")
+    _add_net_common_args(p_net_status)
+
+    p_net_reset = net_sub.add_parser("reset", help="Снять ограничения БС и вернуть Wi-Fi в исходное состояние")
+    _add_net_common_args(p_net_reset)
+
     p_report = sub.add_parser("report", help="Сгенерировать Markdown/JSON отчёт верификации из run.json")
     p_report.add_argument("--input", required=True, help="Путь к run.json с результатами прогона")
     p_report.add_argument("--open-issues", default=None, help="JSON открытых issue для секции кандидатов")
@@ -256,6 +287,17 @@ def _add_debug_common_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_net_common_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--device", default=None, help="ADB serial устройства (по умолчанию 127.0.0.1:<local_adb_port>)")
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        default=argparse.SUPPRESS,
+        help="Вывод в формате JSON",
+    )
+
+
 def _emit(payload: dict[str, Any], *, as_json: bool, stream: TextIO) -> None:
     if as_json:
         stream.write(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
@@ -290,6 +332,9 @@ def run_cli(
 
     if args.command == "debug":
         return _run_debug_cli(args, out=out, err=err)
+
+    if args.command == "net":
+        return _run_net_cli(args, out=out, err=err)
 
     if args.command == "report":
         return _run_report_cli(args, out=out, err=err)
@@ -494,6 +539,41 @@ def _run_debug_cli(args: argparse.Namespace, *, out: TextIO, err: TextIO) -> int
             raise StandError(f"Неизвестная подкоманда debug: {args.debug_command}")
 
         _emit(res.to_dict(), as_json=args.as_json, stream=out)
+        return 0
+    except StandError as exc:
+        if args.as_json:
+            _emit({"ok": False, "error": str(exc)}, as_json=True, stream=out)
+        else:
+            err.write(f"Ошибка: {exc}\n")
+        return 1
+
+
+def _run_net_cli(args: argparse.Namespace, *, out: TextIO, err: TextIO) -> int:
+    device_id = args.device or f"127.0.0.1:{args.local_adb_port}"
+    try:
+        if args.platform.strip().lower() != "android":
+            raise StandError(
+                f"Профили БС поддерживаются только для платформы 'android', получено: {args.platform!r}"
+            )
+        client = NetEmulationClient(
+            device=device_id,
+            adb_bin=args.adb_bin,
+            timeout_s=args.adb_timeout,
+        )
+        if args.net_command == "profile":
+            status = client.apply_profile(
+                args.profile,
+                allow_ips=args.allow_ip,
+                wifi=args.wifi,
+            )
+        elif args.net_command == "status":
+            status = client.status()
+        elif args.net_command == "reset":
+            status = client.reset()
+        else:
+            raise StandError(f"Неизвестная подкоманда net: {args.net_command}")
+
+        _emit(status.to_dict(), as_json=args.as_json, stream=out)
         return 0
     except StandError as exc:
         if args.as_json:

@@ -32,7 +32,47 @@
   - `python3 scripts/app-verify.py --json debug reset-state` — сбросить локальную БД, настройки и debug-overlay.
   - `python3 scripts/app-verify.py --json debug dump-diagnostics [--output <local.json>] [--device-output-path <path>]` — read-only дамп диагностики приложения (локальное сохранение на VPS через `--output`; запись в `cacheDir` на устройстве через `--device-output-path`, алиас `--output-path`).
   - Все подкоманды принимают `--device <serial>` и `--package <pkg>` (по умолчанию `ru.rumap.android.debug`).
+- **Программные профили БС (`net`):** эмуляция белых списков на сотовом интерфейсе эмулятора через отдельную `iptables`-цепочку `RUMAP_WL` (подробности ниже).
 - **Отчёт и GitHub Issues:** `report` рендерит Markdown/сводку из `run.json`, `issues dedup` сверяет находки с открытыми issue, `issues create` заводит issue только после `--confirm-owner-approval` (см. ниже).
+
+## Программная эмуляция белых списков (`net`)
+
+На стенде `ssh home` нет реальных операторских БС, поэтому `net profile` создаёт отдельную
+`iptables`-цепочку `RUMAP_WL` и подключает её к `OUTPUT` строго через сотовый интерфейс
+`$CELL_IF` (определяется динамически из `dumpsys connectivity`: `radio0`, `rmnet_data0` и т.п.).
+Loopback, Wi-Fi (`lo`/`wlan*`), VPN (`tun*`) и диапазон эмулятора `10.0.2.0/24` не затрагиваются;
+внутри цепочки первыми всегда стоят страховочные `RETURN` для `127.0.0.0/8` и `10.0.2.0/24`.
+Перед изменением правил CLI сам выполняет `adb root`, ждёт устройство и проверяет `id -u == 0`.
+
+Профили:
+
+| Профиль | Что делает |
+| --- | --- |
+| `off` | Снимает все ссылки `OUTPUT -> RUMAP_WL`, очищает и удаляет цепочку (идемпотентно). |
+| `soft` | Пропускает TCP:443 только к ориентирам из белого списка + `--allow-ip`, остальной TCP:443 режет (`DROP`), включая контролы `1.1.1.1`, `8.8.8.8`, `9.9.9.9`, `208.67.222.222`. |
+| `hard` | Режет весь TCP:443; ICMP Echo (`echo-request`) разрешён только к белому списку + `--allow-ip`, остальной режется. |
+| `down` | Режет TCP:443 и ICMP Echo полностью. |
+
+```bash
+# Применить профиль; --allow-ip можно повторять или перечислять через запятую
+python3 scripts/app-verify.py --json net profile soft \
+  --allow-ip 1.2.3.4 --allow-ip 5.6.7.8 --wifi off
+python3 scripts/app-verify.py --json net profile hard --wifi on --device 127.0.0.1:15565
+
+# Текущий профиль по фактическим правилам, $CELL_IF, Wi-Fi, сотовая сеть и VPN
+python3 scripts/app-verify.py --json net status
+
+# Гарантированно снять ограничения и вернуть Wi-Fi
+python3 scripts/app-verify.py --json net reset
+```
+
+Встроенный белый список (как в `go/orchestrator/anchors.go`): `77.88.55.242`,
+`87.240.132.78`, `185.71.66.66`, `178.248.232.209`. `--allow-ip` расширяет его без дублей и
+валидируется как IPv4 (некорректный адрес возвращает `StandError`). `--wifi on|off` вызывает
+`svc wifi enable|disable`. При переключении профилей старые правила и ссылки удаляются до
+создания новой цепочки, поэтому дубли не накапливаются. `net status` возвращает `profile`
+(`off`/`soft`/`hard`/`down`/`custom`), `allowed_ips`, `cell_if`, `wifi_enabled`,
+`wifi_connected`, `wifi_interface`, `cellular_connected`, `vpn_active` и `vpn_interface`.
 
 ## Конфигурация UI-драйвера и переменные окружения
 
